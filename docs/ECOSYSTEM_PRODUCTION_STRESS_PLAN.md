@@ -35,6 +35,30 @@ currently provide `rtdb-rs 0.3.2`, so standalone `rtdb-admin` and package/
 publish dry-runs requiring that version fail resolution. Local integrated
 testing uses the four checked-out crate revisions recorded in each artifact.
 
+The second-pass integrated gates are also executable now:
+
+- The standard workload performs actual local `rtdb-sync` writes concurrently
+  with ten remote raw/typed/admin lanes. It derives an expected record per
+  path and compares that model directly with both emulator reads and sync
+  snapshots; no final repair write is used.
+- Two live subscriber collectors per path count real `watch` transitions;
+  every subscriber must observe at least one transition before shutdown.
+- The admin client uses a 25ms controlled token lifetime, repeated refreshes,
+  and active client replacement while the workload is running.
+- `scripts/test-ecosystem-durable.sh` runs live seed, emulator-down queued
+  writes with deliberate process exit, a fresh emulator replay baseline, and
+  100 active remote admin writes during replay. The default 100-mutation
+  backlog passed with replay successes and zero pending mutations.
+- Breakpoint exit codes now distinguish `CAPACITY_LIMIT` (75),
+  `CORRECTNESS_FAILURE` (1), and harness/environment failure (2); only a
+  capacity result is treated as an exploratory breakpoint by the wrapper.
+
+Clean-checkout CI now resolves `rtdb-admin` from its pinned Git revision, so
+the ecosystem dev dependency does not assume a sibling checkout. The package
+step is intentionally deferred in CI until the pinned `rtdb-rs 0.3.2` exists
+on crates.io; the local publication dry-run remains an explicit external
+release blocker rather than a hidden or weakened test.
+
 ## Purpose
 
 This document defines the coordinated stress, endurance, failure-injection, and break-point validation plan for the full Rust Firebase Realtime Database ecosystem:
@@ -848,6 +872,7 @@ scripts/
   test-emulator-recovery.sh
   test-emulator-offline.sh
   test-ecosystem-stress.sh
+  test-ecosystem-durable.sh
   test-ecosystem-heavy.sh
   test-ecosystem-soak.sh
   test-ecosystem-breakpoint.sh

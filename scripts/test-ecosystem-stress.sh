@@ -61,11 +61,26 @@ resource_monitor &
 monitor_pid=$!
 cleanup_monitor() { kill "$monitor_pid" 2>/dev/null || true; }
 trap cleanup_monitor EXIT
+set +e
 npx --yes firebase-tools emulators:exec --only database --project "$project_id" \
   "env FIREBASE_PROJECT_ID='$project_id' RTDB_ECOSYSTEM_PATHS='$paths' RTDB_ECOSYSTEM_GENERATIONS='$generations' RTDB_ECOSYSTEM_RUN='$profile-$stamp' /usr/bin/time -v cargo test --test ecosystem -- --ignored --exact integrated_ecosystem_standard_and_profiles_converge" \
   2>&1 | tee "$artifact"
+test_status=${PIPESTATUS[0]}
+set -e
 end_ns="$(date +%s)"
 cleanup_monitor
+if [[ "$test_status" -ne 0 ]]; then
+  if rg -q 'sync handle did not connect|has been running for over|Elapsed \(\(\)\)' "$artifact"; then
+    echo "result=CAPACITY_LIMIT" | tee -a "$metadata" "$artifact"
+    exit 75
+  elif rg -q 'panicked at|FAILED|test result: FAILED' "$artifact"; then
+    echo "result=CORRECTNESS_FAILURE" | tee -a "$metadata" "$artifact"
+    exit 1
+  else
+    echo "result=HARNESS_OR_ENVIRONMENT_FAILURE" | tee -a "$metadata" "$artifact"
+    exit 2
+  fi
+fi
 echo "duration_seconds=$((end_ns-start_ns))" | tee -a "$metadata" "$artifact"
 echo "resource_samples=$resource_samples" | tee -a "$metadata"
 echo "profile=$profile result=passed artifact=$artifact resource_samples=$resource_samples"

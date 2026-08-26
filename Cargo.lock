@@ -983,6 +983,7 @@ dependencies = [
 [[package]]
 name = "rtdb-admin"
 version = "0.1.0"
+source = "git+https://github.com/kab102395/rtdb-admin.git?rev=423bc0c964cd26ab269d4b810b7c46679fd57f6c#423bc0c964cd26ab269d4b810b7c46679fd57f6c"
 dependencies = [
  "async-trait",
  "jsonwebtoken",
