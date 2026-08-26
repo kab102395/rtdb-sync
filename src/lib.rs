@@ -1658,6 +1658,108 @@ mod tests {
         handle.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn bidirectional_32_path_conflict_profile_converges() {
+        let mut pairs = Vec::new();
+        for path in 0..32u64 {
+            let (events, _) = tokio::sync::broadcast::channel(512);
+            let backend = Arc::new(Live {
+                value: Arc::new(Mutex::new(
+                    serde_json::json!({"path": path, "local": 0, "remote": 0}),
+                )),
+                events,
+            });
+            let handle = start(
+                backend.clone(),
+                format!("bidirectional/{path}"),
+                Config {
+                    write_policy: WritePolicy::Optimistic,
+                    conflict_policy: ConflictPolicy::RemoteWins,
+                    retry: RetryPolicy::Never,
+                    ..Config::default()
+                },
+            );
+            pairs.push((path, backend, handle));
+        }
+        for (_, _, handle) in &pairs {
+            wait_for_status(handle, SyncStatus::Connected).await;
+        }
+        for generation in 1..=100u64 {
+            let writes = pairs.iter().map(|(_, backend, handle)| async move {
+                let local = handle.put("", serde_json::json!({"local": generation}));
+                let remote = backend.patch(
+                    "",
+                    serde_json::json!({"remote": generation})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                );
+                let (local_result, remote_result) = tokio::join!(local, remote);
+                local_result?;
+                remote_result
+            });
+            for result in futures_util::future::join_all(writes).await {
+                result.unwrap();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for (_, backend, handle) in &pairs {
+            assert_eq!(handle.snapshot().value, backend.get("").await.unwrap());
+            assert_eq!(handle.metrics().successful_writes, 100);
+        }
+        for (_, _, handle) in pairs {
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn fan_in_eight_local_producers_preserves_acknowledgements() {
+        let (events, _) = tokio::sync::broadcast::channel(512);
+        let backend = Arc::new(Live {
+            value: Arc::new(Mutex::new(serde_json::json!({"remote": 0}))),
+            events,
+        });
+        let handle = start(
+            backend.clone(),
+            "fan-in",
+            Config {
+                write_policy: WritePolicy::Optimistic,
+                retry: RetryPolicy::Never,
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        let producers = (0..8).map(|producer| {
+            let handle = &handle;
+            async move {
+                for generation in 0..25u64 {
+                    handle
+                        .patch(
+                            "",
+                            serde_json::json!({ (format!("local-{producer}")): generation }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let _ = futures_util::future::join_all(producers).await;
+        backend
+            .patch(
+                "",
+                serde_json::json!({"remote": 1})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(handle.metrics().successful_writes, 200);
+        assert_eq!(handle.snapshot().value, backend.get("").await.unwrap());
+        handle.shutdown().await;
+    }
+
     async fn wait_for_status(handle: &SyncHandle, expected: SyncStatus) {
         let mut status = handle.subscribe_status();
         tokio::time::timeout(Duration::from_secs(5), async {
