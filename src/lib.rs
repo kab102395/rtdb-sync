@@ -9,7 +9,15 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
-use std::{fmt, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +46,8 @@ pub enum SyncError {
     Conversion(String),
     #[error("synchronization cancelled")]
     Cancelled,
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 #[async_trait]
@@ -46,6 +56,9 @@ pub trait Backend: Send + Sync + 'static {
     async fn subscribe(&self, path: &str) -> Result<EventStream, SyncError>;
     async fn put(&self, path: &str, value: Value) -> Result<(), SyncError>;
     async fn patch(&self, path: &str, value: Map<String, Value>) -> Result<(), SyncError>;
+    async fn before_reconnect(&self, _attempt: usize) -> Result<(), SyncError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +83,38 @@ pub enum RetryPolicy {
     },
 }
 
+impl RetryPolicy {
+    pub fn delay(&self, attempt: usize, jitter_max: Duration) -> Option<Duration> {
+        match *self {
+            RetryPolicy::Never => None,
+            RetryPolicy::Exponential {
+                max_attempts,
+                base,
+                max,
+            } => {
+                if max_attempts.map(|n| attempt > n).unwrap_or(false) {
+                    return None;
+                }
+                let factor = 2u32.saturating_pow(attempt.saturating_sub(1) as u32);
+                let backoff = base.saturating_mul(factor).min(max);
+                let jitter = if jitter_max.is_zero() {
+                    Duration::ZERO
+                } else {
+                    let seed = (attempt as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    Duration::from_nanos(seed % (jitter_max.as_nanos() as u64 + 1))
+                };
+                Some(
+                    backoff
+                        .saturating_add(jitter)
+                        .min(max.saturating_add(jitter_max)),
+                )
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WritePolicy {
     Confirmed,
@@ -80,6 +125,7 @@ pub enum WritePolicy {
 pub struct Config {
     pub retry: RetryPolicy,
     pub write_policy: WritePolicy,
+    pub jitter_max: Duration,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -90,6 +136,36 @@ impl Default for Config {
                 max: Duration::from_secs(5),
             },
             write_policy: WritePolicy::Confirmed,
+            jitter_max: Duration::ZERO,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub reconnect_attempts: u64,
+    pub stream_failures: u64,
+    pub hydration_failures: u64,
+    pub successful_writes: u64,
+    pub failed_writes: u64,
+}
+
+#[derive(Default)]
+struct Metrics {
+    reconnect_attempts: AtomicU64,
+    stream_failures: AtomicU64,
+    hydration_failures: AtomicU64,
+    successful_writes: AtomicU64,
+    failed_writes: AtomicU64,
+}
+impl Metrics {
+    fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            reconnect_attempts: self.reconnect_attempts.load(Ordering::Relaxed),
+            stream_failures: self.stream_failures.load(Ordering::Relaxed),
+            hydration_failures: self.hydration_failures.load(Ordering::Relaxed),
+            successful_writes: self.successful_writes.load(Ordering::Relaxed),
+            failed_writes: self.failed_writes.load(Ordering::Relaxed),
         }
     }
 }
@@ -100,6 +176,7 @@ pub struct SyncHandle {
     cancel: CancellationToken,
     writes: mpsc::Sender<Write>,
     join: tokio::task::JoinHandle<()>,
+    metrics: Arc<Metrics>,
 }
 
 enum Write {
@@ -127,6 +204,9 @@ impl SyncHandle {
     }
     pub fn subscribe_status(&self) -> watch::Receiver<SyncStatus> {
         self.status.clone()
+    }
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
     pub async fn put<T: Serialize>(
         &self,
@@ -174,6 +254,8 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
     let cancel = CancellationToken::new();
     let (writes, mut write_rx) = mpsc::channel(64);
     let child = cancel.clone();
+    let metrics = Arc::new(Metrics::default());
+    let task_metrics = metrics.clone();
     let join = tokio::spawn(async move {
         #[allow(unused_assignments)]
         let mut state: Option<Value> = None;
@@ -194,7 +276,19 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                     attempt = 0;
                 }
                 Err(e) => {
-                    if !retry(&config.retry, &mut attempt, &child).await {
+                    task_metrics
+                        .hydration_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    if !retry(
+                        &*backend,
+                        &config,
+                        &mut attempt,
+                        &child,
+                        &status_tx,
+                        &task_metrics,
+                    )
+                    .await
+                    {
                         let _ = status_tx.send(SyncStatus::Failed(e));
                         return;
                     }
@@ -204,7 +298,16 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             let mut stream = match backend.subscribe(&path).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if !retry(&config.retry, &mut attempt, &child).await {
+                    if !retry(
+                        &*backend,
+                        &config,
+                        &mut attempt,
+                        &child,
+                        &status_tx,
+                        &task_metrics,
+                    )
+                    .await
+                    {
                         let _ = status_tx.send(SyncStatus::Failed(e));
                         return;
                     }
@@ -215,11 +318,21 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             loop {
                 tokio::select! {
                     _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
-                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, write, config.write_policy).await; if result.is_err() { let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
+                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, write, config.write_policy).await; if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
                 event = stream.next() => match event { Some(Ok(event)) => match apply_event(&path, state.as_mut().expect("hydrated"), event) { Ok(()) => { generation += 1; let _ = snap_tx.send(Snapshot { generation, value: state.as_ref().expect("hydrated").clone() }); }, Err(e) => { let _ = status_tx.send(SyncStatus::Failed(e)); return; } }, Some(Err(_)) | None => break }
                 }
             }
-            if !retry(&config.retry, &mut attempt, &child).await {
+            task_metrics.stream_failures.fetch_add(1, Ordering::Relaxed);
+            if !retry(
+                &*backend,
+                &config,
+                &mut attempt,
+                &child,
+                &status_tx,
+                &task_metrics,
+            )
+            .await
+            {
                 let _ = status_tx.send(SyncStatus::Stopped);
                 return;
             }
@@ -231,26 +344,31 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
         cancel,
         writes,
         join,
+        metrics,
     }
 }
 
-async fn retry(policy: &RetryPolicy, attempt: &mut usize, cancel: &CancellationToken) -> bool {
-    match *policy {
-        RetryPolicy::Never => false,
-        RetryPolicy::Exponential {
-            max_attempts,
-            base,
-            max,
-        } => {
-            *attempt += 1;
-            if max_attempts.map(|n| *attempt > n).unwrap_or(false) {
-                return false;
-            }
-            let factor = 2u32.saturating_pow((*attempt).saturating_sub(1) as u32);
-            let delay = base.saturating_mul(factor).min(max);
-            tokio::select! { _ = cancel.cancelled() => false, _ = tokio::time::sleep(delay) => true }
-        }
+async fn retry<B: Backend + ?Sized>(
+    backend: &B,
+    config: &Config,
+    attempt: &mut usize,
+    cancel: &CancellationToken,
+    status: &watch::Sender<SyncStatus>,
+    metrics: &Metrics,
+) -> bool {
+    *attempt += 1;
+    let Some(delay) = config.retry.delay(*attempt, config.jitter_max) else {
+        return false;
+    };
+    metrics.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+    let _ = status.send(SyncStatus::Reconnecting {
+        attempt: *attempt,
+        delay,
+    });
+    if backend.before_reconnect(*attempt).await.is_err() {
+        return false;
     }
+    tokio::select! { _ = cancel.cancelled() => false, _ = tokio::time::sleep(delay) => true }
 }
 
 async fn handle_write<B: Backend + ?Sized>(
@@ -441,6 +559,8 @@ pub enum SyncStatus {
     Hydrating,
     /// A realtime stream is active.
     Connected,
+    /// The stream or hydration request is being retried.
+    Reconnecting { attempt: usize, delay: Duration },
     /// Synchronization has stopped.
     Stopped,
     /// A non-recoverable backend, conversion, or event error occurred.
@@ -588,6 +708,35 @@ mod tests {
         writes: Arc<Mutex<Vec<String>>>,
     }
 
+    struct Flaky {
+        subscriptions: AtomicU64,
+        replacements: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Backend for Flaky {
+        async fn get(&self, _: &str) -> Result<Value, SyncError> {
+            Ok(Value::Null)
+        }
+        async fn subscribe(&self, _: &str) -> Result<EventStream, SyncError> {
+            if self.subscriptions.fetch_add(1, Ordering::Relaxed) == 0 {
+                Ok(Box::pin(stream::empty()))
+            } else {
+                Ok(Box::pin(stream::pending()))
+            }
+        }
+        async fn put(&self, _: &str, _: Value) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn patch(&self, _: &str, _: Map<String, Value>) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn before_reconnect(&self, _: usize) -> Result<(), SyncError> {
+            self.replacements.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl Backend for Mock {
         async fn get(&self, _: &str) -> Result<Value, SyncError> {
@@ -699,6 +848,7 @@ mod tests {
             Config {
                 retry: RetryPolicy::Never,
                 write_policy: WritePolicy::Optimistic,
+                ..Config::default()
             },
         );
         let mut status = handle.subscribe_status();
@@ -886,6 +1036,32 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reconnect_status_metrics_and_backend_hook_are_observable() {
+        let backend = Arc::new(Flaky {
+            subscriptions: AtomicU64::new(0),
+            replacements: AtomicU64::new(0),
+        });
+        let handle = start(
+            backend.clone(),
+            "flaky",
+            Config {
+                retry: RetryPolicy::Exponential {
+                    max_attempts: Some(3),
+                    base: Duration::from_millis(1),
+                    max: Duration::from_millis(5),
+                },
+                jitter_max: Duration::from_millis(1),
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        assert_eq!(backend.replacements.load(Ordering::Relaxed), 1);
+        assert_eq!(handle.metrics().stream_failures, 1);
+        assert_eq!(handle.metrics().reconnect_attempts, 1);
+        handle.shutdown().await;
+    }
+
     async fn wait_for_status(handle: &SyncHandle, expected: SyncStatus) {
         let mut status = handle.subscribe_status();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -905,6 +1081,17 @@ mod tests {
     fn retry_policy_is_bounded_and_paths_are_safe() {
         assert!(segments("a/../b").is_err());
         assert!(matches!(RetryPolicy::Never, RetryPolicy::Never));
+        let policy = RetryPolicy::Exponential {
+            max_attempts: Some(3),
+            base: Duration::from_millis(10),
+            max: Duration::from_millis(40),
+        };
+        assert_eq!(
+            policy.delay(1, Duration::ZERO),
+            Some(Duration::from_millis(10))
+        );
+        assert!(policy.delay(3, Duration::from_millis(5)).unwrap() <= Duration::from_millis(45));
+        assert_eq!(policy.delay(4, Duration::ZERO), None);
         let mut value = Value::Null;
         assert!(apply_event(
             "root",
