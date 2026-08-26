@@ -74,6 +74,90 @@ impl Snapshot {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedSnapshot<T> {
+    pub generation: u64,
+    pub value: T,
+}
+
+pub struct TypedSyncHandle<T> {
+    inner: SyncHandle,
+    snapshot: watch::Receiver<Result<TypedSnapshot<T>, SyncError>>,
+    conversion_task: tokio::task::JoinHandle<()>,
+}
+
+impl<T: Clone> TypedSyncHandle<T> {
+    pub fn snapshot(&self) -> Result<TypedSnapshot<T>, SyncError> {
+        self.snapshot.borrow().clone()
+    }
+    pub fn subscribe(&self) -> watch::Receiver<Result<TypedSnapshot<T>, SyncError>> {
+        self.snapshot.clone()
+    }
+    pub fn status(&self) -> SyncStatus {
+        self.inner.status()
+    }
+    pub fn subscribe_status(&self) -> watch::Receiver<SyncStatus> {
+        self.inner.subscribe_status()
+    }
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.inner.metrics()
+    }
+    pub async fn put<V: Serialize>(
+        &self,
+        path: impl Into<String>,
+        value: V,
+    ) -> Result<(), SyncError> {
+        self.inner.put(path, value).await
+    }
+    pub async fn patch<V: Serialize>(
+        &self,
+        path: impl Into<String>,
+        value: V,
+    ) -> Result<(), SyncError> {
+        self.inner.patch(path, value).await
+    }
+    pub async fn shutdown(self) {
+        self.inner.shutdown().await;
+        let _ = self.conversion_task.await;
+    }
+}
+
+pub fn start_typed<B, T>(
+    backend: Arc<B>,
+    path: impl Into<String>,
+    config: Config,
+) -> TypedSyncHandle<T>
+where
+    B: Backend,
+    T: DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let inner = start(backend, path, config);
+    let mut raw = inner.subscribe();
+    let initial = raw.borrow().decode::<T>().map(|value| TypedSnapshot {
+        generation: raw.borrow().generation,
+        value,
+    });
+    let (snapshot, receiver) = watch::channel(initial);
+    let conversion_task = tokio::spawn(async move {
+        loop {
+            if raw.changed().await.is_err() {
+                break;
+            }
+            let current = raw.borrow().clone();
+            let converted = current.decode::<T>().map(|value| TypedSnapshot {
+                generation: current.generation,
+                value,
+            });
+            let _ = snapshot.send(converted);
+        }
+    });
+    TypedSyncHandle {
+        inner,
+        snapshot: receiver,
+        conversion_task,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryPolicy {
     Never,
@@ -956,6 +1040,49 @@ mod tests {
             handle.snapshot().decode::<Model>().unwrap(),
             Model { count: 4 }
         );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn typed_handle_surfaces_conversion_errors_after_partial_updates() {
+        #[derive(Debug, Clone, Deserialize, PartialEq)]
+        struct Model {
+            count: u32,
+        }
+        let backend = mock(
+            serde_json::json!({"count": 1}),
+            vec![
+                Event::Patch {
+                    path: "".into(),
+                    data: serde_json::json!({"count": 2}).as_object().unwrap().clone(),
+                },
+                Event::Put {
+                    path: "".into(),
+                    data: serde_json::json!({"count": "not-a-number"}),
+                },
+            ],
+        );
+        let handle = start_typed::<_, Model>(
+            Arc::new(backend),
+            "typed",
+            Config {
+                retry: RetryPolicy::Never,
+                ..Config::default()
+            },
+        );
+        let mut snapshots = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status() != SyncStatus::Connected {
+                snapshots.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(matches!(
+            &*snapshots.borrow(),
+            Err(SyncError::Conversion(_))
+        ));
         handle.shutdown().await;
     }
 
