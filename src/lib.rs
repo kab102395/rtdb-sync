@@ -762,6 +762,16 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
     let metrics = Arc::new(Metrics::default());
     let task_metrics = metrics.clone();
     let join = tokio::spawn(async move {
+        if matches!(
+            config.offline_policy,
+            OfflinePolicy::QueueWhileOffline | OfflinePolicy::QueueWithLimit { .. }
+        ) && persistence.is_none()
+        {
+            let _ = status_tx.send(SyncStatus::Failed(SyncError::Persistence(
+                "offline queue requires a persistence backend".into(),
+            )));
+            return;
+        }
         #[allow(unused_assignments)]
         let mut state: Option<Value> = None;
         let mut generation = 0;
@@ -2942,6 +2952,71 @@ mod tests {
         .unwrap();
         assert_eq!(store.load("durable-test").unwrap().pending.len(), 0);
         second.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn offline_queue_limit_is_visible_and_missing_store_is_rejected() {
+        let backend = Arc::new(Failing);
+        let no_store = start(
+            backend.clone(),
+            "root",
+            Config {
+                offline_policy: OfflinePolicy::QueueWhileOffline,
+                ..Config::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    no_store.status(),
+                    SyncStatus::Failed(SyncError::Persistence(_))
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        no_store.shutdown().await;
+
+        let store = Arc::new(MemoryPersistence::default());
+        let online = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (events, _) = tokio::sync::broadcast::channel(4);
+        let backend = Arc::new(Recoverable {
+            online,
+            value: Arc::new(Mutex::new(Value::Null)),
+            events,
+        });
+        let handle = start(
+            backend,
+            "root",
+            Config {
+                persistence: Some(store),
+                persistence_key: Some("limit".into()),
+                offline_policy: OfflinePolicy::QueueWithLimit { max_pending: 1 },
+                write_policy: WritePolicy::Optimistic,
+                retry: RetryPolicy::Exponential {
+                    max_attempts: None,
+                    base: Duration::from_millis(5),
+                    max: Duration::from_millis(20),
+                },
+                ..Config::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while handle.status() != SyncStatus::Offline {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.put("a", 1).await.unwrap();
+        assert!(matches!(
+            handle.put("b", 2).await,
+            Err(SyncError::Persistence(_))
+        ));
+        handle.shutdown().await;
     }
 
     fn durable_emulator_config(store: Arc<FilePersistence>) -> Config {
