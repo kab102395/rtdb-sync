@@ -965,8 +965,8 @@ mod tests {
             return;
         };
         let root = test_root("crud");
-        let backend =
-            RtdbBackend::new(format!("http://{host}"), "").with_namespace("demo-rtdb-sync");
+        let backend = RtdbBackend::new(format!("http://{host}"), "")
+            .with_namespace("demo-rtdb-sync-default-rtdb");
         backend
             .put(&root, serde_json::json!({"generation": 1}))
             .await
@@ -1013,7 +1013,8 @@ mod tests {
             return;
         };
         let backend = Arc::new(
-            RtdbBackend::new(format!("http://{host}"), "").with_namespace("demo-rtdb-sync"),
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
         );
         let mut handles = Vec::new();
         for path in 0..32 {
@@ -1085,6 +1086,26 @@ mod tests {
         for (_, handle) in handles {
             handle.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn emulator_namespaces_are_isolated_when_configured() {
+        let Ok(host) = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST") else {
+            return;
+        };
+        let left =
+            RtdbBackend::new(format!("http://{host}"), "").with_namespace("rtdb-sync-ns-left");
+        let right =
+            RtdbBackend::new(format!("http://{host}"), "").with_namespace("rtdb-sync-ns-right");
+        left.put("isolation", serde_json::json!({"owner": "left"}))
+            .await
+            .unwrap();
+        right
+            .put("isolation", serde_json::json!({"owner": "right"}))
+            .await
+            .unwrap();
+        assert_eq!(left.get("isolation").await.unwrap()["owner"], "left");
+        assert_eq!(right.get("isolation").await.unwrap()["owner"], "right");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
