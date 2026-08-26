@@ -25,6 +25,7 @@ mkdir -p "$artifact_dir"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 artifact="$artifact_dir/${profile}-${stamp}.log"
 metadata="$artifact_dir/${profile}-${stamp}.env"
+resource_samples="$artifact_dir/${profile}-${stamp}.resources.tsv"
 {
   echo "profile=$profile"
   echo "project=$project_id"
@@ -48,9 +49,23 @@ export RTDB_ECOSYSTEM_PATHS="$paths"
 export RTDB_ECOSYSTEM_GENERATIONS="$generations"
 export RTDB_ECOSYSTEM_RUN="${profile}-${stamp}"
 start_ns="$(date +%s)"
+echo -e "timestamp\tpid\tcpu_percent\trss_kb" > "$resource_samples"
+resource_monitor() {
+  while true; do
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    ps -eo pid=,pcpu=,rss=,args= | awk -v now="$now" '/firebase-database-emulator-v.*jar/ {print now "\t" $1 "\t" $2 "\t" $3}' >> "$resource_samples"
+    sleep 2
+  done
+}
+resource_monitor &
+monitor_pid=$!
+cleanup_monitor() { kill "$monitor_pid" 2>/dev/null || true; }
+trap cleanup_monitor EXIT
 npx --yes firebase-tools emulators:exec --only database --project "$project_id" \
   "env FIREBASE_PROJECT_ID='$project_id' RTDB_ECOSYSTEM_PATHS='$paths' RTDB_ECOSYSTEM_GENERATIONS='$generations' RTDB_ECOSYSTEM_RUN='$profile-$stamp' /usr/bin/time -v cargo test --test ecosystem -- --ignored --exact integrated_ecosystem_standard_and_profiles_converge" \
   2>&1 | tee "$artifact"
 end_ns="$(date +%s)"
+cleanup_monitor
 echo "duration_seconds=$((end_ns-start_ns))" | tee -a "$metadata" "$artifact"
-echo "profile=$profile result=passed artifact=$artifact"
+echo "resource_samples=$resource_samples" | tee -a "$metadata"
+echo "profile=$profile result=passed artifact=$artifact resource_samples=$resource_samples"

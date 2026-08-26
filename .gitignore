@@ -1,4 +1,5 @@
 /target
+/artifacts
 /firebase-debug.log
 /firebase-debug.*.log
 /database-debug.log

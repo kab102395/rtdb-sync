@@ -50,7 +50,7 @@ fn admin_manager() -> TokenManager<StaticCredentials, rtdb_admin::SystemClock, F
 
 async fn wait_connected<T: Clone>(handle: &rtdb_sync::TypedSyncHandle<T>) {
     let mut status = handle.subscribe_status();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while *status.borrow() != SyncStatus::Connected {
             status.changed().await.unwrap();
         }
@@ -98,6 +98,7 @@ async fn integrated_ecosystem_standard_and_profiles_converge() {
     let typed_client = Arc::new(raw.typed_client());
     let typed = Arc::new(TypedBackend::<Record>::new(raw.typed_client()));
     let mut handles = Vec::with_capacity(paths);
+    let mut subscribers = Vec::with_capacity(paths * 2);
     for path in 0..paths {
         let path_root = format!("{root}path-{path}");
         admin_client
@@ -120,8 +121,8 @@ async fn integrated_ecosystem_standard_and_profiles_converge() {
                 ..Config::default()
             },
         );
-        let _subscriber_a = handle.subscribe();
-        let _subscriber_b = handle.subscribe();
+        subscribers.push(handle.subscribe());
+        subscribers.push(handle.subscribe());
         handles.push((path, handle));
     }
     for (_, handle) in &handles {

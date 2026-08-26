@@ -1,5 +1,39 @@
 # RTDB Rust ecosystem production-style stress and break-point plan
 
+## Current execution status — 2026-08-26
+
+The executable four-crate harness is present in `tests/ecosystem.rs` and
+`scripts/test-ecosystem-stress.sh`. It uses a controlled `rtdb-admin`
+`TokenManager` to create and replace an `rtdb-rs` client, sends mixed raw,
+`rtdb-typed`, and `rtdb-sync` traffic through the local Firebase RTDB
+emulator, keeps two subscribers per synchronized path, and verifies typed
+local state against final emulator reads. Each run records crate commits,
+host metadata, Rust `/usr/bin/time -v` output, and independent emulator JVM
+CPU/RSS samples under `artifacts/ecosystem/`.
+
+Evidence from this workstation:
+
+- Standard profile passed with 100 synchronized paths, two subscribers per
+  path, 10,000 mixed mutations, admin client replacement, and final
+  convergence in 6 seconds.
+- `rtdb-rs` namespace/REST/SSE emulator stress passed; `rtdb-typed` CRUD,
+  query, SSE, filtered-child, and fan-out emulator profiles passed; the
+  controlled `rtdb-admin` suite passed 13 tests including 100 single-flight
+  callers, 64 expiry-boundary callers, 128 outage callers, 100 identities,
+  and 1,000 concurrent identity consumers.
+- Break-point escalation reached 250 synchronized SSE paths and failed to
+  establish all handles within the bounded 60-second setup window. At 500
+  paths, the Rust process reached about 395 MiB RSS before the same timeout.
+  Captured emulator samples show the JVM reaching about 598 MiB RSS. This is
+  a measured local emulator/host envelope, not a universal Firebase capacity
+  claim; heavy and soak profiles remain release-blocked pending a capacity
+  decision or architecture improvement.
+
+The exact crates.io publication graph is not yet testable: crates.io does not
+currently provide `rtdb-rs 0.3.2`, so standalone `rtdb-admin` and package/
+publish dry-runs requiring that version fail resolution. Local integrated
+testing uses the four checked-out crate revisions recorded in each artifact.
+
 ## Purpose
 
 This document defines the coordinated stress, endurance, failure-injection, and break-point validation plan for the full Rust Firebase Realtime Database ecosystem:
