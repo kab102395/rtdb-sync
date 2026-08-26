@@ -826,6 +826,27 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                         generation,
                         value: state_ref.clone(),
                     });
+                    if let Some(store) = persistence.as_ref() {
+                        if let Err(error) = store.store_snapshot(&DurableSnapshot {
+                            format_version: PERSISTENCE_FORMAT_VERSION,
+                            sync_key: sync_key.clone(),
+                            generation,
+                            value: state_ref.clone(),
+                            saved_at_ms: now_ms(),
+                        }) {
+                            task_metrics
+                                .persistence_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = status_tx.send(SyncStatus::Failed(error));
+                            return;
+                        }
+                        let _ = store.store_metadata(&SyncMetadata {
+                            format_version: PERSISTENCE_FORMAT_VERSION,
+                            sync_key: sync_key.clone(),
+                            last_remote_event_at_ms: None,
+                            last_successful_sync_at_ms: Some(now_ms()),
+                        });
+                    }
                     if !durable_pending.is_empty() {
                         let _ = status_tx.send(SyncStatus::Replaying);
                         if replay_pending(
@@ -933,7 +954,27 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                 tokio::select! {
                     _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
                 Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, write, config.write_policy).await; if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
-                event = stream.next() => match event { Some(Ok(event)) => match reconcile_event(&path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, event, config.conflict_policy) { Ok(()) => {}, Err(e) => { let _ = status_tx.send(SyncStatus::Failed(e)); return; } }, Some(Err(_)) | None => break }
+                event = stream.next() => match event {
+                    Some(Ok(event)) => match reconcile_event(&path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, event, config.conflict_policy) {
+                        Ok(()) => {
+                            if let Some(store) = persistence.as_ref() {
+                                if let Err(error) = store.store_snapshot(&DurableSnapshot {
+                                    format_version: PERSISTENCE_FORMAT_VERSION,
+                                    sync_key: sync_key.clone(),
+                                    generation,
+                                    value: state.as_ref().expect("hydrated").clone(),
+                                    saved_at_ms: now_ms(),
+                                }) {
+                                    task_metrics.persistence_failures.fetch_add(1, Ordering::Relaxed);
+                                    let _ = status_tx.send(SyncStatus::Failed(error));
+                                    return;
+                                }
+                            }
+                        },
+                        Err(e) => { let _ = status_tx.send(SyncStatus::Failed(e)); return; }
+                    },
+                    Some(Err(_)) | None => break
+                }
                 }
             }
             task_metrics.stream_failures.fetch_add(1, Ordering::Relaxed);
@@ -1672,6 +1713,61 @@ mod tests {
         }
         async fn patch(&self, _: &str, _: Map<String, Value>) -> Result<(), SyncError> {
             Err(SyncError::Backend("injected write failure".into()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Recoverable {
+        online: Arc<std::sync::atomic::AtomicBool>,
+        value: Arc<Mutex<Value>>,
+        events: tokio::sync::broadcast::Sender<Event>,
+    }
+
+    #[async_trait]
+    impl Backend for Recoverable {
+        async fn get(&self, _: &str) -> Result<Value, SyncError> {
+            if !self.online.load(Ordering::Relaxed) {
+                return Err(SyncError::Backend("offline".into()));
+            }
+            Ok(self.value.lock().unwrap().clone())
+        }
+        async fn subscribe(&self, _: &str) -> Result<EventStream, SyncError> {
+            if !self.online.load(Ordering::Relaxed) {
+                return Err(SyncError::Backend("offline".into()));
+            }
+            let mut receiver = self.events.subscribe();
+            Ok(Box::pin(async_stream::stream! {
+                loop { match receiver.recv().await { Ok(event) => yield Ok(event), Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, Err(tokio::sync::broadcast::error::RecvError::Closed) => break } }
+            }))
+        }
+        async fn put(&self, _: &str, value: Value) -> Result<(), SyncError> {
+            if !self.online.load(Ordering::Relaxed) {
+                return Err(SyncError::Backend("offline".into()));
+            }
+            *self.value.lock().unwrap() = value.clone();
+            let _ = self.events.send(Event::Put {
+                path: "".into(),
+                data: value,
+            });
+            Ok(())
+        }
+        async fn patch(&self, _: &str, value: Map<String, Value>) -> Result<(), SyncError> {
+            if !self.online.load(Ordering::Relaxed) {
+                return Err(SyncError::Backend("offline".into()));
+            }
+            apply_event(
+                "",
+                &mut self.value.lock().unwrap(),
+                Event::Patch {
+                    path: "".into(),
+                    data: value.clone(),
+                },
+            )?;
+            let _ = self.events.send(Event::Patch {
+                path: "".into(),
+                data: value,
+            });
+            Ok(())
         }
     }
 
@@ -2581,6 +2677,193 @@ mod tests {
         assert!(matches!(store.load(key), Err(SyncError::Persistence(_))));
         store.clear(key).unwrap();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn durable_queue_restores_offline_state_and_replays_after_restart() {
+        let store = Arc::new(MemoryPersistence::default());
+        let online = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (events, _) = tokio::sync::broadcast::channel(16);
+        let backend = Arc::new(Recoverable {
+            online: online.clone(),
+            value: Arc::new(Mutex::new(serde_json::json!({"count": 0}))),
+            events,
+        });
+        let config = Config {
+            persistence: Some(store.clone()),
+            persistence_key: Some("durable-test".into()),
+            offline_policy: OfflinePolicy::QueueWithLimit { max_pending: 2 },
+            write_policy: WritePolicy::Optimistic,
+            retry: RetryPolicy::Exponential {
+                max_attempts: None,
+                base: Duration::from_millis(5),
+                max: Duration::from_millis(20),
+            },
+            ..Config::default()
+        };
+        let first = start(backend.clone(), "root", config.clone());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if first.status() == SyncStatus::Offline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first
+            .put("", serde_json::json!({"count": 1}))
+            .await
+            .unwrap();
+        assert_eq!(first.metrics().pending_mutations, 1);
+        first.shutdown().await;
+        assert_eq!(store.load("durable-test").unwrap().pending.len(), 1);
+
+        online.store(true, Ordering::Relaxed);
+        let second = start(backend.clone(), "root", config);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if backend.get("root").await.unwrap()["count"] == 1
+                    && second.metrics().pending_mutations == 0
+                    && second.status() == SyncStatus::Connected
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.load("durable-test").unwrap().pending.len(), 0);
+        second.shutdown().await;
+    }
+
+    fn durable_emulator_config(store: Arc<FilePersistence>) -> Config {
+        Config {
+            persistence: Some(store),
+            persistence_key: Some("durable-emulator-acceptance".into()),
+            offline_policy: OfflinePolicy::QueueWhileOffline,
+            write_policy: WritePolicy::Optimistic,
+            retry: RetryPolicy::Exponential {
+                max_attempts: None,
+                base: Duration::from_millis(10),
+                max: Duration::from_millis(50),
+            },
+            ..Config::default()
+        }
+    }
+
+    fn durable_emulator_store() -> Arc<FilePersistence> {
+        Arc::new(
+            FilePersistence::new(std::env::var("RTDB_DURABLE_STORE").expect("RTDB_DURABLE_STORE"))
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "run through scripts/test-emulator-offline.sh"]
+    async fn durable_emulator_seed_persists_snapshot() {
+        let host = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST").expect("emulator host");
+        let store = durable_emulator_store();
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
+        );
+        emulator_put_retry(
+            &backend,
+            "durable-acceptance",
+            serde_json::json!({"count": 1}),
+        )
+        .await
+        .unwrap();
+        let handle = start(
+            backend,
+            "durable-acceptance",
+            durable_emulator_config(store.clone()),
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        handle.shutdown().await;
+        assert!(store
+            .load("durable-emulator-acceptance")
+            .unwrap()
+            .snapshot
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "run through scripts/test-emulator-offline.sh"]
+    async fn durable_emulator_queues_while_database_is_down() {
+        let host = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST").expect("emulator host");
+        let store = durable_emulator_store();
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
+        );
+        let handle = start(
+            backend,
+            "durable-acceptance",
+            durable_emulator_config(store.clone()),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if handle.status() == SyncStatus::Offline {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle
+            .put("", serde_json::json!({"count": 2}))
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        assert_eq!(
+            store
+                .load("durable-emulator-acceptance")
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run through scripts/test-emulator-offline.sh"]
+    async fn durable_emulator_replays_after_database_returns() {
+        let host = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST").expect("emulator host");
+        let store = durable_emulator_store();
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
+        );
+        let handle = start(
+            backend.clone(),
+            "durable-acceptance",
+            durable_emulator_config(store.clone()),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if backend.get("durable-acceptance").await.unwrap()["count"] == 2
+                    && handle.metrics().pending_mutations == 0
+                    && handle.metrics().replay_successes == 1
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        assert!(store
+            .load("durable-emulator-acceptance")
+            .unwrap()
+            .pending
+            .is_empty());
+        handle.shutdown().await;
     }
 
     #[test]
