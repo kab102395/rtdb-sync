@@ -12,12 +12,16 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use std::{
     fmt,
+    fs::{self, File, OpenOptions},
+    hash::{Hash, Hasher},
+    io::{BufRead, BufReader, Write as IoWrite},
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
@@ -49,6 +53,369 @@ pub enum SyncError {
     Cancelled,
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("persistence: {0}")]
+    Persistence(String),
+}
+
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableSnapshot {
+    pub format_version: u32,
+    pub sync_key: String,
+    pub generation: u64,
+    pub value: Value,
+    pub saved_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum DurableMutationKind {
+    Put,
+    Patch,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DurableMutation {
+    pub format_version: u32,
+    pub sync_key: String,
+    pub id: u64,
+    pub path: String,
+    pub kind: DurableMutationKind,
+    pub payload: Value,
+    pub generation: u64,
+    pub created_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SyncMetadata {
+    pub format_version: u32,
+    pub sync_key: String,
+    pub last_remote_event_at_ms: Option<u64>,
+    pub last_successful_sync_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PersistedState {
+    pub snapshot: Option<DurableSnapshot>,
+    pub pending: Vec<DurableMutation>,
+    pub metadata: Option<SyncMetadata>,
+}
+
+pub trait PersistenceBackend: Send + Sync + fmt::Debug {
+    fn load(&self, sync_key: &str) -> Result<PersistedState, SyncError>;
+    fn store_snapshot(&self, snapshot: &DurableSnapshot) -> Result<(), SyncError>;
+    fn append_mutation(&self, mutation: &DurableMutation) -> Result<(), SyncError>;
+    fn acknowledge_mutation(&self, sync_key: &str, mutation_id: u64) -> Result<(), SyncError>;
+    fn compact(&self, sync_key: &str) -> Result<(), SyncError>;
+    fn store_metadata(&self, metadata: &SyncMetadata) -> Result<(), SyncError>;
+    fn clear(&self, sync_key: &str) -> Result<(), SyncError>;
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MemoryPersistence {
+    entries: Arc<Mutex<std::collections::HashMap<String, PersistedState>>>,
+}
+
+impl PersistenceBackend for MemoryPersistence {
+    fn load(&self, sync_key: &str) -> Result<PersistedState, SyncError> {
+        Ok(self
+            .entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?
+            .get(sync_key)
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn store_snapshot(&self, snapshot: &DurableSnapshot) -> Result<(), SyncError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?;
+        let entry = entries.entry(snapshot.sync_key.clone()).or_default();
+        entry.snapshot = Some(snapshot.clone());
+        Ok(())
+    }
+    fn append_mutation(&self, mutation: &DurableMutation) -> Result<(), SyncError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?;
+        entries
+            .entry(mutation.sync_key.clone())
+            .or_default()
+            .pending
+            .push(mutation.clone());
+        Ok(())
+    }
+    fn acknowledge_mutation(&self, sync_key: &str, mutation_id: u64) -> Result<(), SyncError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?;
+        if let Some(entry) = entries.get_mut(sync_key) {
+            entry.pending.retain(|mutation| mutation.id != mutation_id);
+        }
+        Ok(())
+    }
+    fn compact(&self, _sync_key: &str) -> Result<(), SyncError> {
+        Ok(())
+    }
+    fn store_metadata(&self, metadata: &SyncMetadata) -> Result<(), SyncError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?;
+        entries
+            .entry(metadata.sync_key.clone())
+            .or_default()
+            .metadata = Some(metadata.clone());
+        Ok(())
+    }
+    fn clear(&self, sync_key: &str) -> Result<(), SyncError> {
+        self.entries
+            .lock()
+            .map_err(|_| SyncError::Persistence("memory store lock poisoned".into()))?
+            .remove(sync_key);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FilePersistence {
+    root: Arc<PathBuf>,
+}
+
+impl FilePersistence {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, SyncError> {
+        let root = root.into();
+        fs::create_dir_all(&root).map_err(|error| persistence_io(&root, error))?;
+        restrict_permissions(&root, 0o700)?;
+        Ok(Self {
+            root: Arc::new(root),
+        })
+    }
+
+    fn directory(&self, sync_key: &str) -> Result<PathBuf, SyncError> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sync_key.hash(&mut hasher);
+        let directory = self.root.join(format!("{:016x}", hasher.finish()));
+        fs::create_dir_all(&directory).map_err(|error| persistence_io(&directory, error))?;
+        restrict_permissions(&directory, 0o700)?;
+        Ok(directory)
+    }
+    fn path(&self, sync_key: &str, name: &str) -> Result<PathBuf, SyncError> {
+        Ok(self.directory(sync_key)?.join(name))
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum JournalEntry {
+    Append(DurableMutation),
+    Acknowledge { sync_key: String, mutation_id: u64 },
+}
+
+impl PersistenceBackend for FilePersistence {
+    fn load(&self, sync_key: &str) -> Result<PersistedState, SyncError> {
+        let snapshot_path = self.path(sync_key, "snapshot.json")?;
+        let metadata_path = self.path(sync_key, "metadata.json")?;
+        let journal_path = self.path(sync_key, "journal.jsonl")?;
+        let snapshot = if snapshot_path.exists() {
+            let bytes =
+                fs::read(&snapshot_path).map_err(|error| persistence_io(&snapshot_path, error))?;
+            let value: DurableSnapshot = serde_json::from_slice(&bytes)
+                .map_err(|error| SyncError::Persistence(format!("invalid snapshot: {error}")))?;
+            validate_key_and_version(&value.format_version, &value.sync_key, sync_key)?;
+            Some(value)
+        } else {
+            None
+        };
+        let metadata = if metadata_path.exists() {
+            let bytes =
+                fs::read(&metadata_path).map_err(|error| persistence_io(&metadata_path, error))?;
+            let value: SyncMetadata = serde_json::from_slice(&bytes)
+                .map_err(|error| SyncError::Persistence(format!("invalid metadata: {error}")))?;
+            validate_key_and_version(&value.format_version, &value.sync_key, sync_key)?;
+            Some(value)
+        } else {
+            None
+        };
+        let mut pending = std::collections::BTreeMap::new();
+        if journal_path.exists() {
+            for line in BufReader::new(
+                File::open(&journal_path).map_err(|error| persistence_io(&journal_path, error))?,
+            )
+            .lines()
+            {
+                let line = line.map_err(|error| persistence_io(&journal_path, error))?;
+                let entry: JournalEntry = serde_json::from_str(&line).map_err(|error| {
+                    SyncError::Persistence(format!("invalid journal entry: {error}"))
+                })?;
+                match entry {
+                    JournalEntry::Append(mutation) => {
+                        validate_key_and_version(
+                            &mutation.format_version,
+                            &mutation.sync_key,
+                            sync_key,
+                        )?;
+                        pending.insert(mutation.id, mutation);
+                    }
+                    JournalEntry::Acknowledge {
+                        sync_key: entry_key,
+                        mutation_id,
+                    } => {
+                        if entry_key != sync_key {
+                            return Err(SyncError::Persistence(
+                                "journal namespace mismatch".into(),
+                            ));
+                        }
+                        pending.remove(&mutation_id);
+                    }
+                }
+            }
+        }
+        Ok(PersistedState {
+            snapshot,
+            pending: pending.into_values().collect(),
+            metadata,
+        })
+    }
+    fn store_snapshot(&self, snapshot: &DurableSnapshot) -> Result<(), SyncError> {
+        validate_key_and_version(
+            &snapshot.format_version,
+            &snapshot.sync_key,
+            &snapshot.sync_key,
+        )?;
+        let path = self.path(&snapshot.sync_key, "snapshot.json")?;
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(snapshot)
+            .map_err(|error| SyncError::Persistence(error.to_string()))?;
+        write_atomic(&path, &tmp, &bytes)
+    }
+    fn append_mutation(&self, mutation: &DurableMutation) -> Result<(), SyncError> {
+        validate_key_and_version(
+            &mutation.format_version,
+            &mutation.sync_key,
+            &mutation.sync_key,
+        )?;
+        let path = self.path(&mutation.sync_key, "journal.jsonl")?;
+        append_line(&path, &JournalEntry::Append(mutation.clone()))
+    }
+    fn acknowledge_mutation(&self, sync_key: &str, mutation_id: u64) -> Result<(), SyncError> {
+        let path = self.path(sync_key, "journal.jsonl")?;
+        append_line(
+            &path,
+            &JournalEntry::Acknowledge {
+                sync_key: sync_key.into(),
+                mutation_id,
+            },
+        )
+    }
+    fn compact(&self, sync_key: &str) -> Result<(), SyncError> {
+        let state = self.load(sync_key)?;
+        let path = self.path(sync_key, "journal.jsonl")?;
+        let tmp = path.with_extension("jsonl.tmp");
+        let mut bytes = Vec::new();
+        for mutation in state.pending {
+            serde_json::to_writer(&mut bytes, &JournalEntry::Append(mutation))
+                .map_err(|error| SyncError::Persistence(error.to_string()))?;
+            bytes.push(b'\n');
+        }
+        write_atomic(&path, &tmp, &bytes)
+    }
+    fn store_metadata(&self, metadata: &SyncMetadata) -> Result<(), SyncError> {
+        validate_key_and_version(
+            &metadata.format_version,
+            &metadata.sync_key,
+            &metadata.sync_key,
+        )?;
+        let path = self.path(&metadata.sync_key, "metadata.json")?;
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(metadata)
+            .map_err(|error| SyncError::Persistence(error.to_string()))?;
+        write_atomic(&path, &tmp, &bytes)
+    }
+    fn clear(&self, sync_key: &str) -> Result<(), SyncError> {
+        let directory = self.directory(sync_key)?;
+        if directory.exists() {
+            fs::remove_dir_all(&directory).map_err(|error| persistence_io(&directory, error))?;
+        }
+        Ok(())
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn validate_key_and_version(
+    version: &u32,
+    entry_key: &str,
+    expected_key: &str,
+) -> Result<(), SyncError> {
+    if *version != PERSISTENCE_FORMAT_VERSION {
+        return Err(SyncError::Persistence(format!(
+            "unsupported persistence format version {version}"
+        )));
+    }
+    if entry_key != expected_key {
+        return Err(SyncError::Persistence(
+            "persistence namespace mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn persistence_io(path: &Path, error: std::io::Error) -> SyncError {
+    SyncError::Persistence(format!("{}: {error}", path.display()))
+}
+
+fn restrict_permissions(path: &Path, mode: u32) -> Result<(), SyncError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|error| persistence_io(path, error))?;
+    }
+    Ok(())
+}
+
+fn write_atomic(path: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), SyncError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(tmp)
+        .map_err(|error| persistence_io(tmp, error))?;
+    file.write_all(bytes)
+        .map_err(|error| persistence_io(tmp, error))?;
+    file.sync_all()
+        .map_err(|error| persistence_io(tmp, error))?;
+    restrict_permissions(tmp, 0o600)?;
+    fs::rename(tmp, path).map_err(|error| persistence_io(path, error))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn append_line<T: serde::Serialize>(path: &Path, entry: &T) -> Result<(), SyncError> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| persistence_io(path, error))?;
+    serde_json::to_writer(&mut file, entry)
+        .map_err(|error| SyncError::Persistence(error.to_string()))?;
+    file.write_all(b"\n")
+        .map_err(|error| persistence_io(path, error))?;
+    file.sync_all()
+        .map_err(|error| persistence_io(path, error))?;
+    restrict_permissions(path, 0o600)
 }
 
 #[async_trait]
@@ -213,6 +580,13 @@ pub enum ConflictPolicy {
     Reject,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflinePolicy {
+    RejectWhileOffline,
+    QueueWhileOffline,
+    QueueWithLimit { max_pending: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub retry: RetryPolicy,
@@ -221,6 +595,9 @@ pub struct Config {
     pub conflict_policy: ConflictPolicy,
     /// Maximum number of local mutations waiting for the synchronization task.
     pub write_queue_capacity: usize,
+    pub persistence: Option<Arc<dyn PersistenceBackend>>,
+    pub persistence_key: Option<String>,
+    pub offline_policy: OfflinePolicy,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -234,6 +611,9 @@ impl Default for Config {
             jitter_max: Duration::ZERO,
             conflict_policy: ConflictPolicy::RemoteWins,
             write_queue_capacity: 64,
+            persistence: None,
+            persistence_key: None,
+            offline_policy: OfflinePolicy::RejectWhileOffline,
         }
     }
 }
@@ -245,6 +625,12 @@ pub struct MetricsSnapshot {
     pub hydration_failures: u64,
     pub successful_writes: u64,
     pub failed_writes: u64,
+    pub pending_mutations: u64,
+    pub persistence_failures: u64,
+    pub replay_attempts: u64,
+    pub replay_successes: u64,
+    pub replay_failures: u64,
+    pub conflict_count: u64,
 }
 
 #[derive(Default)]
@@ -254,6 +640,12 @@ struct Metrics {
     hydration_failures: AtomicU64,
     successful_writes: AtomicU64,
     failed_writes: AtomicU64,
+    pending_mutations: AtomicU64,
+    persistence_failures: AtomicU64,
+    replay_attempts: AtomicU64,
+    replay_successes: AtomicU64,
+    replay_failures: AtomicU64,
+    conflict_count: AtomicU64,
 }
 impl Metrics {
     fn snapshot(&self) -> MetricsSnapshot {
@@ -263,6 +655,12 @@ impl Metrics {
             hydration_failures: self.hydration_failures.load(Ordering::Relaxed),
             successful_writes: self.successful_writes.load(Ordering::Relaxed),
             failed_writes: self.failed_writes.load(Ordering::Relaxed),
+            pending_mutations: self.pending_mutations.load(Ordering::Relaxed),
+            persistence_failures: self.persistence_failures.load(Ordering::Relaxed),
+            replay_attempts: self.replay_attempts.load(Ordering::Relaxed),
+            replay_successes: self.replay_successes.load(Ordering::Relaxed),
+            replay_failures: self.replay_failures.load(Ordering::Relaxed),
+            conflict_count: self.conflict_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -348,6 +746,11 @@ impl SyncHandle {
 
 pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Config) -> SyncHandle {
     let path = path.into();
+    let persistence = config.persistence.clone();
+    let sync_key = config
+        .persistence_key
+        .clone()
+        .unwrap_or_else(|| path.clone());
     let (snap_tx, snap_rx) = watch::channel(Snapshot {
         generation: 0,
         value: Value::Null,
@@ -364,9 +767,56 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
         let mut generation = 0;
         let mut attempt = 0usize;
         let mut pending = Vec::new();
+        let mut durable_pending = Vec::new();
+        if let Some(store) = persistence.as_ref() {
+            match store.load(&sync_key) {
+                Ok(restored) => {
+                    if let Some(snapshot) = restored.snapshot {
+                        state = Some(snapshot.value);
+                        generation = snapshot.generation;
+                        let _ = snap_tx.send(Snapshot {
+                            generation,
+                            value: state.as_ref().unwrap().clone(),
+                        });
+                        let _ = status_tx.send(SyncStatus::RestoredStale);
+                    }
+                    for mutation in restored.pending {
+                        match durable_event(&mutation) {
+                            Ok(event) => {
+                                pending.push(PendingMutation {
+                                    path: mutation.path.clone(),
+                                    event,
+                                });
+                                durable_pending.push(mutation);
+                            }
+                            Err(error) => {
+                                task_metrics
+                                    .persistence_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let _ = status_tx.send(SyncStatus::Failed(error));
+                                return;
+                            }
+                        }
+                    }
+                    task_metrics
+                        .pending_mutations
+                        .store(durable_pending.len() as u64, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    task_metrics
+                        .persistence_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = status_tx.send(SyncStatus::Failed(error));
+                    return;
+                }
+            }
+        }
         let _ = status_tx.send(SyncStatus::Hydrating);
         loop {
-            let hydrated = tokio::select! { _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; }, result = backend.get(&path) => result };
+            let hydrated = tokio::select! {
+                _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
+                result = backend.get(&path) => result
+            };
             match hydrated {
                 Ok(value) => {
                     state = Some(value);
@@ -376,12 +826,73 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                         generation,
                         value: state_ref.clone(),
                     });
+                    if !durable_pending.is_empty() {
+                        let _ = status_tx.send(SyncStatus::Replaying);
+                        if replay_pending(
+                            &*backend,
+                            &path,
+                            state.as_mut().unwrap(),
+                            &mut generation,
+                            &snap_tx,
+                            &mut pending,
+                            &mut durable_pending,
+                            persistence.as_ref(),
+                            &sync_key,
+                            &task_metrics,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            let _ = status_tx.send(SyncStatus::Offline);
+                            continue;
+                        }
+                    }
                     attempt = 0;
                 }
                 Err(e) => {
                     task_metrics
                         .hydration_failures
                         .fetch_add(1, Ordering::Relaxed);
+                    let offline_store = if matches!(
+                        config.offline_policy,
+                        OfflinePolicy::QueueWhileOffline | OfflinePolicy::QueueWithLimit { .. }
+                    ) {
+                        persistence.as_ref()
+                    } else {
+                        None
+                    };
+                    if let Some(store) = offline_store {
+                        let _ = status_tx.send(SyncStatus::Offline);
+                        let delay = config
+                            .retry
+                            .delay(attempt.saturating_add(1), config.jitter_max)
+                            .unwrap_or(Duration::from_secs(1));
+                        tokio::select! {
+                            _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
+                            Some(write) = write_rx.recv() => {
+                                let result = handle_offline_write(
+                                    write,
+                                    state.get_or_insert(Value::Null),
+                                    &mut generation,
+                                    &snap_tx,
+                                    &mut pending,
+                                    &mut durable_pending,
+                                    store,
+                                    &sync_key,
+                                    config.offline_policy,
+                                );
+                                if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); }
+                                else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); }
+                                task_metrics.pending_mutations.store(durable_pending.len() as u64, Ordering::Relaxed);
+                            }
+                            _ = tokio::time::sleep(delay) => {
+                                attempt = attempt.saturating_add(1);
+                                task_metrics.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+                                let _ = backend.before_reconnect(attempt).await;
+                            }
+                        }
+                        continue;
+                    }
                     if !retry(
                         &*backend,
                         &config,
@@ -472,6 +983,171 @@ async fn retry<B: Backend + ?Sized>(
         return false;
     }
     tokio::select! { _ = cancel.cancelled() => false, _ = tokio::time::sleep(delay) => true }
+}
+
+fn durable_event(mutation: &DurableMutation) -> Result<Event, SyncError> {
+    validate_key_and_version(
+        &mutation.format_version,
+        &mutation.sync_key,
+        &mutation.sync_key,
+    )?;
+    match mutation.kind {
+        DurableMutationKind::Put => Ok(Event::Put {
+            path: mutation.path.clone(),
+            data: mutation.payload.clone(),
+        }),
+        DurableMutationKind::Patch => Ok(Event::Patch {
+            path: mutation.path.clone(),
+            data: mutation.payload.as_object().cloned().ok_or_else(|| {
+                SyncError::Persistence("journal patch payload is not an object".into())
+            })?,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_offline_write(
+    write: Write,
+    state: &mut Value,
+    generation: &mut u64,
+    tx: &watch::Sender<Snapshot>,
+    pending: &mut Vec<PendingMutation>,
+    durable_pending: &mut Vec<DurableMutation>,
+    persistence: &Arc<dyn PersistenceBackend>,
+    sync_key: &str,
+    policy: OfflinePolicy,
+) -> Result<(), SyncError> {
+    if let OfflinePolicy::QueueWithLimit { max_pending } = policy {
+        if durable_pending.len() >= max_pending {
+            let error = SyncError::Persistence("offline mutation queue is full".into());
+            match write {
+                Write::Put(_, _, done) | Write::Patch(_, _, done) => {
+                    let _ = done.send(Err(error.clone()));
+                }
+            }
+            return Err(error);
+        }
+    }
+    let (path, kind, payload, done) = match write {
+        Write::Put(path, payload, done) => (path, DurableMutationKind::Put, payload, done),
+        Write::Patch(path, payload, done) => (
+            path,
+            DurableMutationKind::Patch,
+            Value::Object(payload),
+            done,
+        ),
+    };
+    let event = match kind {
+        DurableMutationKind::Put => Event::Put {
+            path: path.clone(),
+            data: payload.clone(),
+        },
+        DurableMutationKind::Patch => Event::Patch {
+            path: path.clone(),
+            data: payload.as_object().cloned().unwrap_or_default(),
+        },
+    };
+    let mut next = state.clone();
+    if matches!(
+        policy,
+        OfflinePolicy::QueueWhileOffline | OfflinePolicy::QueueWithLimit { .. }
+    ) {
+        apply_event("", &mut next, event.clone())?;
+    }
+    let mutation = DurableMutation {
+        format_version: PERSISTENCE_FORMAT_VERSION,
+        sync_key: sync_key.into(),
+        id: durable_pending
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+        path: path.clone(),
+        kind,
+        payload,
+        generation: generation.saturating_add(1),
+        created_at_ms: now_ms(),
+    };
+    persistence.append_mutation(&mutation)?;
+    *state = next;
+    *generation = mutation.generation;
+    let _ = tx.send(Snapshot {
+        generation: *generation,
+        value: state.clone(),
+    });
+    pending.push(PendingMutation { path, event });
+    durable_pending.push(mutation);
+    persistence.store_snapshot(&DurableSnapshot {
+        format_version: PERSISTENCE_FORMAT_VERSION,
+        sync_key: sync_key.into(),
+        generation: *generation,
+        value: state.clone(),
+        saved_at_ms: now_ms(),
+    })?;
+    let _ = done.send(Ok(()));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replay_pending<B: Backend + ?Sized>(
+    backend: &B,
+    root: &str,
+    _state: &mut Value,
+    _generation: &mut u64,
+    _tx: &watch::Sender<Snapshot>,
+    pending: &mut Vec<PendingMutation>,
+    durable_pending: &mut Vec<DurableMutation>,
+    persistence: Option<&Arc<dyn PersistenceBackend>>,
+    sync_key: &str,
+    metrics: &Metrics,
+) -> Result<(), SyncError> {
+    for mutation in durable_pending.clone() {
+        metrics.replay_attempts.fetch_add(1, Ordering::Relaxed);
+        let remote_path = join(root, &mutation.path)?;
+        let result = match mutation.kind {
+            DurableMutationKind::Put => backend.put(&remote_path, mutation.payload.clone()).await,
+            DurableMutationKind::Patch => {
+                backend
+                    .patch(
+                        &remote_path,
+                        mutation.payload.as_object().cloned().ok_or_else(|| {
+                            SyncError::Persistence("journal patch payload is not an object".into())
+                        })?,
+                    )
+                    .await
+            }
+        };
+        if let Err(error) = result {
+            metrics.replay_failures.fetch_add(1, Ordering::Relaxed);
+            return Err(error);
+        }
+        if let Some(store) = persistence {
+            store.acknowledge_mutation(sync_key, mutation.id)?;
+        }
+        if let Some(index) = durable_pending
+            .iter()
+            .position(|entry| entry.id == mutation.id)
+        {
+            durable_pending.remove(index);
+        }
+        if let Ok(event) = durable_event(&mutation) {
+            if let Some(index) = pending
+                .iter()
+                .position(|entry| equivalent_event(&entry.event, &event))
+            {
+                pending.remove(index);
+            }
+        }
+        metrics.replay_successes.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(store) = persistence {
+        store.compact(sync_key)?;
+    }
+    metrics
+        .pending_mutations
+        .store(durable_pending.len() as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -745,6 +1421,12 @@ pub enum SyncStatus {
     Idle,
     /// Initial state is being hydrated.
     Hydrating,
+    /// A durable snapshot is available, but remote freshness is unconfirmed.
+    RestoredStale,
+    /// The remote backend is unavailable while local state remains usable.
+    Offline,
+    /// Durable local mutations are being replayed.
+    Replaying,
     /// A realtime stream is active.
     Connected,
     /// The stream or hydration request is being retried.
@@ -1859,6 +2541,46 @@ mod tests {
             }
         }
         Err(last.unwrap_or_else(|| SyncError::Backend("emulator did not accept write".into())))
+    }
+
+    #[test]
+    fn file_persistence_is_versioned_atomic_and_namespace_isolated() {
+        let root =
+            std::env::temp_dir().join(format!("rtdb-sync-persistence-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = FilePersistence::new(&root).unwrap();
+        let key = "user-a/path";
+        store
+            .store_snapshot(&DurableSnapshot {
+                format_version: PERSISTENCE_FORMAT_VERSION,
+                sync_key: key.into(),
+                generation: 7,
+                value: serde_json::json!({"ok": true}),
+                saved_at_ms: now_ms(),
+            })
+            .unwrap();
+        store
+            .append_mutation(&DurableMutation {
+                format_version: PERSISTENCE_FORMAT_VERSION,
+                sync_key: key.into(),
+                id: 11,
+                path: "child".into(),
+                kind: DurableMutationKind::Patch,
+                payload: serde_json::json!({"count": 1}),
+                generation: 8,
+                created_at_ms: now_ms(),
+            })
+            .unwrap();
+        assert_eq!(store.load(key).unwrap().pending.len(), 1);
+        assert!(store.load("other/path").unwrap().pending.is_empty());
+        store.acknowledge_mutation(key, 11).unwrap();
+        store.compact(key).unwrap();
+        assert!(store.load(key).unwrap().pending.is_empty());
+        let snapshot_path = store.path(key, "snapshot.json").unwrap();
+        fs::write(snapshot_path, b"not-json").unwrap();
+        assert!(matches!(store.load(key), Err(SyncError::Persistence(_))));
+        store.clear(key).unwrap();
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
