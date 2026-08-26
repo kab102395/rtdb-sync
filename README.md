@@ -82,6 +82,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo package --allow-dirty
 cargo publish --dry-run --allow-dirty
 ./scripts/test-emulator.sh
+./scripts/test-emulator-offline.sh
 ```
 
 The emulator command is restricted to `demo-*` projects and runs the CRUD/SSE

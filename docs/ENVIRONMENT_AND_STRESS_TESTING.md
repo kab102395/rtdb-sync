@@ -87,7 +87,7 @@ These tests are functional concurrency and correctness stress tests. They should
 
 ## Release discipline
 
-For every release candidate: run formatting, clippy with warnings denied, all deterministic tests, package verification, publish dry-run, then the standard emulator stress profile. Heavy profiles are required before milestone releases and whenever synchronization internals materially change.
+For every release candidate: run formatting, clippy with warnings denied, all deterministic tests, package verification, publish dry-run, then the standard emulator stress profile and the durable offline acceptance. Heavy profiles are required before milestone releases and whenever synchronization internals materially change.
 
 ## Current evidence
 
@@ -99,8 +99,11 @@ profiles, and a real emulator restart harness. The manual resilience runner
 executes 10 outage/recovery cycles with 64 paths per cycle and waits for every
 stream to reconnect before checking convergence.
 
-The latest local run passed 19 deterministic tests and all 10 resilience
-cycles. These are correctness and lifecycle tests, not production capacity
+The latest local run passed 23 deterministic tests, the complete standard
+emulator suite, the 32-path restart/recovery harness, and the durable
+three-process offline acceptance. The 64-path resilience runner has also
+passed 10 outage/recovery cycles. These are correctness and lifecycle tests,
+not production capacity
 benchmarks. The bidirectional failure/delayed-ack behavior is covered by the
 injected mock failure and rollback tests; a real Firebase service cannot inject
 those transport faults without an external fault proxy.
