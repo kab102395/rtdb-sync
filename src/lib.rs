@@ -1238,6 +1238,92 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn manual_heavy_64_path_profile_converges() {
+        if std::env::var("RTDB_SYNC_HEAVY").ok().as_deref() != Some("1") {
+            return;
+        }
+        let host = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST").expect("emulator host");
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
+        );
+        let mut handles = Vec::new();
+        for path in 0..64 {
+            let root = test_root(&format!("heavy/{path}"));
+            let handle = start(
+                backend.clone(),
+                root,
+                Config {
+                    retry: RetryPolicy::Never,
+                    ..Config::default()
+                },
+            );
+            handles.push((path, handle));
+        }
+        for (path, handle) in &handles {
+            wait_for_status(handle, SyncStatus::Connected).await;
+            backend
+                .put(
+                    &test_root(&format!("heavy/{path}")),
+                    serde_json::json!({"path": path, "generation": 0}),
+                )
+                .await
+                .unwrap();
+        }
+        for generation in 1..=100 {
+            let writes = (0..64).map(|path| {
+                let backend = backend.clone();
+                async move {
+                    let root = test_root(&format!("heavy/{path}"));
+                    if generation % 3 == 1 {
+                        backend
+                            .patch(
+                                &root,
+                                serde_json::json!({"generation": generation})
+                                    .as_object()
+                                    .unwrap()
+                                    .clone(),
+                            )
+                            .await
+                    } else if generation % 3 == 2 {
+                        backend.put(&root, Value::Null).await?;
+                        backend
+                            .put(
+                                &root,
+                                serde_json::json!({"path": path, "generation": generation}),
+                            )
+                            .await
+                    } else {
+                        backend
+                            .put(
+                                &root,
+                                serde_json::json!({"path": path, "generation": generation}),
+                            )
+                            .await
+                    }
+                }
+            });
+            for result in futures_util::future::join_all(writes).await {
+                result.unwrap();
+            }
+        }
+        for (path, handle) in &handles {
+            let mut updates = handle.subscribe();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while updates.borrow().value["generation"] != 100 {
+                    updates.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(updates.borrow().value["path"], *path);
+        }
+        for (_, handle) in handles {
+            handle.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn emulator_namespaces_are_isolated_when_configured() {
         let Ok(host) = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST") else {
