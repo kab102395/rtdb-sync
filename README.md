@@ -18,11 +18,9 @@ rtdb-rs          Firebase REST + SSE transport
 Firebase RTDB
 ```
 
-## 0.1.0 target
+## Implemented foundation and synchronization
 
-The first release is intentionally one-way: Firebase -> synchronized Rust state.
-
-Planned foundation:
+The core supports Firebase -> Rust synchronization plus delegated local writes:
 
 - initial state hydration
 - typed local state snapshot
@@ -34,17 +32,18 @@ Planned foundation:
 - deterministic localhost tests
 - Firebase Realtime Database emulator integration
 - concurrency and fan-out stress testing
-
-Bidirectional local writes, optimistic updates, and conflict handling are deferred until the state/event semantics are proven.
+- confirmed or optimistic local PUT/PATCH writes
+- bounded write queues, acknowledgement tracking, rollback, echo suppression,
+  and explicit conflict policies
 
 See `docs/ROADMAP.md` and `docs/ENVIRONMENT_AND_STRESS_TESTING.md`.
 
 ## Status
 
-The 0.1.0 one-way synchronization core is implemented: hydration, typed
-snapshots, PUT/PATCH/null event application, watch notifications, cancellation,
-reconnect backoff, confirmed or optimistic writes, and a Firebase REST/SSE
-backend are available. The API remains pre-1.0 and may change.
+The synchronization core is implemented: hydration, typed snapshots,
+PUT/PATCH/null event application, watch notifications, cancellation, reconnect
+backoff, confirmed or optimistic writes, conflict handling, and a Firebase
+REST/SSE backend are available. The API remains pre-1.0 and may change.
 
 Run the deterministic and lint gates with:
 

@@ -88,9 +88,26 @@ These tests are functional concurrency and correctness stress tests. They should
 
 For every release candidate: run formatting, clippy with warnings denied, all deterministic tests, package verification, publish dry-run, then the standard emulator stress profile. Heavy profiles are required before milestone releases and whenever synchronization internals materially change.
 
-## Current implementation gap
+## Current evidence
 
-The current tests include only synthetic preloaded-event profiles for 32 paths
-and 64 subscribers, plus a direct Firebase adapter CRUD/SSE smoke test. They do
-not yet satisfy the remote-mutation, churn, namespace, outage/recovery, or
-bidirectional conflict profiles above. Those profiles remain release blockers.
+The repository now includes deterministic unit and mock suites, official
+emulator CRUD/SSE and namespace tests, a 32-path remote-mutation profile, a
+64-path heavy profile, 64-subscriber fan-out, 100-task lifecycle churn, typed
+conversion failure coverage, bidirectional local/remote conflict and fan-in
+profiles, and a real emulator restart harness. The manual resilience runner
+executes 10 outage/recovery cycles with 64 paths per cycle and waits for every
+stream to reconnect before checking convergence.
+
+The latest local run passed 19 deterministic tests and all 10 resilience
+cycles. These are correctness and lifecycle tests, not production capacity
+benchmarks. The bidirectional failure/delayed-ack behavior is covered by the
+injected mock failure and rollback tests; a real Firebase service cannot inject
+those transport faults without an external fault proxy.
+
+## Known release limitation
+
+`cargo fmt`, `cargo test --all-targets --all-features`, and clippy with denied
+warnings pass. `cargo package`/publish dry-run cannot complete until the
+git-pinned `rtdb-rs` 0.3.2 release is available on crates.io; the package
+metadata now carries the correct upstream versions rather than silently
+claiming an older transport API.

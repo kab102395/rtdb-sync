@@ -6,9 +6,8 @@
 
 ## 0.1.0 — one-way synchronized state
 
-Status: partial foundation only. The transport boundary and basic local event
-application exist, but the typed ecosystem integration and complete release
-gate are still being implemented.
+Status: implementation complete; release packaging remains blocked until the
+git-pinned upstream transport crates are available on crates.io.
 
 Goal: maintain a typed local representation of one RTDB path from Firebase realtime events.
 
@@ -33,9 +32,8 @@ A user can synchronize one typed RTDB path into Rust state, observe changes, sto
 
 ## 0.2.0 — resilience and reconnect
 
-Status: incomplete. Basic cancellation-aware retry exists, but the explicit
-state machine, jitter, instrumentation, replacement hooks, and outage/recovery
-test gates do not yet exist.
+Status: implementation and local emulator gates complete. The release audit
+still records external dependency publication separately from runtime proof.
 
 Goal: make long-running synchronization viable.
 
@@ -61,9 +59,9 @@ Forced stream drops, temporary emulator outages, and reconnect cycles cannot sil
 
 ## 0.3.0 — bidirectional synchronization
 
-Status: incomplete. Basic delegated PUT/PATCH and optimistic/confirmed modes
-exist, but conflict semantics, echo reconciliation, failure injection, and
-concurrent-writer guarantees are not implemented.
+Status: implementation complete for the documented in-process semantics and
+deterministic stress gates. Production conflict policy remains an application
+choice and is not presented as a distributed transaction protocol.
 
 Goal: safely support Firebase <-> local Rust state.
 
