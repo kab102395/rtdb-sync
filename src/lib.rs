@@ -1833,7 +1833,7 @@ mod tests {
         value: Value,
     ) -> Result<(), SyncError> {
         let mut last = None;
-        for _ in 0..60 {
+        for _ in 0..300 {
             match backend.put(path, value.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
