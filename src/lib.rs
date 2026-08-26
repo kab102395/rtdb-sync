@@ -418,6 +418,61 @@ fn append_line<T: serde::Serialize>(path: &Path, entry: &T) -> Result<(), SyncEr
     restrict_permissions(path, 0o600)
 }
 
+async fn persistence_load(
+    store: Arc<dyn PersistenceBackend>,
+    sync_key: String,
+) -> Result<PersistedState, SyncError> {
+    tokio::task::spawn_blocking(move || store.load(&sync_key))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
+async fn persistence_snapshot(
+    store: Arc<dyn PersistenceBackend>,
+    snapshot: DurableSnapshot,
+) -> Result<(), SyncError> {
+    tokio::task::spawn_blocking(move || store.store_snapshot(&snapshot))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
+async fn persistence_append(
+    store: Arc<dyn PersistenceBackend>,
+    mutation: DurableMutation,
+) -> Result<(), SyncError> {
+    tokio::task::spawn_blocking(move || store.append_mutation(&mutation))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
+async fn persistence_ack(
+    store: Arc<dyn PersistenceBackend>,
+    sync_key: String,
+    mutation_id: u64,
+) -> Result<(), SyncError> {
+    tokio::task::spawn_blocking(move || store.acknowledge_mutation(&sync_key, mutation_id))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
+async fn persistence_compact(
+    store: Arc<dyn PersistenceBackend>,
+    sync_key: String,
+) -> Result<(), SyncError> {
+    tokio::task::spawn_blocking(move || store.compact(&sync_key))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
+async fn persistence_metadata(
+    store: Arc<dyn PersistenceBackend>,
+    metadata: SyncMetadata,
+) -> Result<(), SyncError> {
+    tokio::task::spawn_blocking(move || store.store_metadata(&metadata))
+        .await
+        .map_err(|error| SyncError::Persistence(format!("persistence worker failed: {error}")))?
+}
+
 #[async_trait]
 pub trait Backend: Send + Sync + 'static {
     async fn get(&self, path: &str) -> Result<Value, SyncError>;
@@ -779,7 +834,7 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
         let mut pending = Vec::new();
         let mut durable_pending = Vec::new();
         if let Some(store) = persistence.as_ref() {
-            match store.load(&sync_key) {
+            match persistence_load(store.clone(), sync_key.clone()).await {
                 Ok(restored) => {
                     if let Some(snapshot) = restored.snapshot {
                         state = Some(snapshot.value);
@@ -837,25 +892,41 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                         value: state_ref.clone(),
                     });
                     if let Some(store) = persistence.as_ref() {
-                        if let Err(error) = store.store_snapshot(&DurableSnapshot {
-                            format_version: PERSISTENCE_FORMAT_VERSION,
-                            sync_key: sync_key.clone(),
-                            generation,
-                            value: state_ref.clone(),
-                            saved_at_ms: now_ms(),
-                        }) {
+                        if let Err(error) = persistence_snapshot(
+                            store.clone(),
+                            DurableSnapshot {
+                                format_version: PERSISTENCE_FORMAT_VERSION,
+                                sync_key: sync_key.clone(),
+                                generation,
+                                value: state_ref.clone(),
+                                saved_at_ms: now_ms(),
+                            },
+                        )
+                        .await
+                        {
                             task_metrics
                                 .persistence_failures
                                 .fetch_add(1, Ordering::Relaxed);
                             let _ = status_tx.send(SyncStatus::Failed(error));
                             return;
                         }
-                        let _ = store.store_metadata(&SyncMetadata {
-                            format_version: PERSISTENCE_FORMAT_VERSION,
-                            sync_key: sync_key.clone(),
-                            last_remote_event_at_ms: None,
-                            last_successful_sync_at_ms: Some(now_ms()),
-                        });
+                        if let Err(error) = persistence_metadata(
+                            store.clone(),
+                            SyncMetadata {
+                                format_version: PERSISTENCE_FORMAT_VERSION,
+                                sync_key: sync_key.clone(),
+                                last_remote_event_at_ms: None,
+                                last_successful_sync_at_ms: Some(now_ms()),
+                            },
+                        )
+                        .await
+                        {
+                            task_metrics
+                                .persistence_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = status_tx.send(SyncStatus::Failed(error));
+                            return;
+                        }
                     }
                     if !durable_pending.is_empty() {
                         let _ = status_tx.send(SyncStatus::Replaying);
@@ -911,7 +982,7 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                                     store,
                                     &sync_key,
                                     config.offline_policy,
-                                );
+                                ).await;
                                 if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); }
                                 else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); }
                                 task_metrics.pending_mutations.store(durable_pending.len() as u64, Ordering::Relaxed);
@@ -998,13 +1069,13 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                     Some(Ok(event)) => match reconcile_event(&path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, event, config.conflict_policy) {
                         Ok(()) => {
                             if let Some(store) = persistence.as_ref() {
-                                if let Err(error) = store.store_snapshot(&DurableSnapshot {
+                                if let Err(error) = persistence_snapshot(store.clone(), DurableSnapshot {
                                     format_version: PERSISTENCE_FORMAT_VERSION,
                                     sync_key: sync_key.clone(),
                                     generation,
                                     value: state.as_ref().expect("hydrated").clone(),
                                     saved_at_ms: now_ms(),
-                                }) {
+                                }).await {
                                     task_metrics.persistence_failures.fetch_add(1, Ordering::Relaxed);
                                     let _ = status_tx.send(SyncStatus::Failed(error));
                                     return;
@@ -1148,7 +1219,7 @@ fn durable_mutation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_offline_write(
+async fn handle_offline_write(
     write: Write,
     state: &mut Value,
     generation: &mut u64,
@@ -1211,7 +1282,10 @@ fn handle_offline_write(
         generation: generation.saturating_add(1),
         created_at_ms: now_ms(),
     };
-    persistence.append_mutation(&mutation)?;
+    if let Err(error) = persistence_append(persistence.clone(), mutation.clone()).await {
+        let _ = done.send(Err(error.clone()));
+        return Err(error);
+    }
     *state = next;
     *generation = mutation.generation;
     let _ = tx.send(Snapshot {
@@ -1220,13 +1294,21 @@ fn handle_offline_write(
     });
     pending.push(PendingMutation { path, event });
     durable_pending.push(mutation);
-    persistence.store_snapshot(&DurableSnapshot {
-        format_version: PERSISTENCE_FORMAT_VERSION,
-        sync_key: sync_key.into(),
-        generation: *generation,
-        value: state.clone(),
-        saved_at_ms: now_ms(),
-    })?;
+    if let Err(error) = persistence_snapshot(
+        persistence.clone(),
+        DurableSnapshot {
+            format_version: PERSISTENCE_FORMAT_VERSION,
+            sync_key: sync_key.into(),
+            generation: *generation,
+            value: state.clone(),
+            saved_at_ms: now_ms(),
+        },
+    )
+    .await
+    {
+        let _ = done.send(Err(error.clone()));
+        return Err(error);
+    }
     let _ = done.send(Ok(()));
     Ok(())
 }
@@ -1272,14 +1354,18 @@ async fn replay_pending<B: Backend + ?Sized>(
             value: state.clone(),
         });
         if let Some(store) = persistence {
-            store.store_snapshot(&DurableSnapshot {
-                format_version: PERSISTENCE_FORMAT_VERSION,
-                sync_key: sync_key.into(),
-                generation: *generation,
-                value: state.clone(),
-                saved_at_ms: now_ms(),
-            })?;
-            store.acknowledge_mutation(sync_key, mutation.id)?;
+            persistence_snapshot(
+                store.clone(),
+                DurableSnapshot {
+                    format_version: PERSISTENCE_FORMAT_VERSION,
+                    sync_key: sync_key.into(),
+                    generation: *generation,
+                    value: state.clone(),
+                    saved_at_ms: now_ms(),
+                },
+            )
+            .await?;
+            persistence_ack(store.clone(), sync_key.into(), mutation.id).await?;
         }
         if let Some(index) = durable_pending
             .iter()
@@ -1296,7 +1382,7 @@ async fn replay_pending<B: Backend + ?Sized>(
         metrics.replay_successes.fetch_add(1, Ordering::Relaxed);
     }
     if let Some(store) = persistence {
-        store.compact(sync_key)?;
+        persistence_compact(store.clone(), sync_key.into()).await?;
     }
     metrics
         .pending_mutations
@@ -1342,7 +1428,7 @@ async fn reconnect_or_queue<B: Backend + ?Sized>(
                     persistence,
                     sync_key,
                     config.offline_policy,
-                );
+                ).await;
                 if result.is_ok() {
                     metrics.successful_writes.fetch_add(1, Ordering::Relaxed);
                 } else {
@@ -1384,7 +1470,7 @@ async fn handle_write<B: Backend + ?Sized>(
             let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
             if let Some(store) = persistence {
                 let mutation = durable.clone().unwrap();
-                if let Err(error) = store.append_mutation(&mutation) {
+                if let Err(error) = persistence_append(Arc::clone(store), mutation.clone()).await {
                     let _ = done.send(Err(error.clone()));
                     return Err(error);
                 }
@@ -1400,13 +1486,18 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
                 if let Some(store) = persistence {
-                    if let Err(error) = store.store_snapshot(&DurableSnapshot {
-                        format_version: PERSISTENCE_FORMAT_VERSION,
-                        sync_key: sync_key.into(),
-                        generation: *generation,
-                        value: state.clone(),
-                        saved_at_ms: now_ms(),
-                    }) {
+                    if let Err(error) = persistence_snapshot(
+                        Arc::clone(store),
+                        DurableSnapshot {
+                            format_version: PERSISTENCE_FORMAT_VERSION,
+                            sync_key: sync_key.into(),
+                            generation: *generation,
+                            value: state.clone(),
+                            saved_at_ms: now_ms(),
+                        },
+                    )
+                    .await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
@@ -1419,11 +1510,15 @@ async fn handle_write<B: Backend + ?Sized>(
             let result = backend.put(&backend_path, value).await;
             if result.is_ok() {
                 if let (Some(store), Some(mutation)) = (persistence, durable) {
-                    if let Err(error) = store.acknowledge_mutation(sync_key, mutation.id) {
+                    if let Err(error) =
+                        persistence_ack(Arc::clone(store), sync_key.into(), mutation.id).await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
-                    if let Err(error) = store.compact(sync_key) {
+                    if let Err(error) =
+                        persistence_compact(Arc::clone(store), sync_key.into()).await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
@@ -1462,7 +1557,7 @@ async fn handle_write<B: Backend + ?Sized>(
             let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
             if let Some(store) = persistence {
                 let mutation = durable.clone().unwrap();
-                if let Err(error) = store.append_mutation(&mutation) {
+                if let Err(error) = persistence_append(Arc::clone(store), mutation.clone()).await {
                     let _ = done.send(Err(error.clone()));
                     return Err(error);
                 }
@@ -1478,13 +1573,18 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
                 if let Some(store) = persistence {
-                    if let Err(error) = store.store_snapshot(&DurableSnapshot {
-                        format_version: PERSISTENCE_FORMAT_VERSION,
-                        sync_key: sync_key.into(),
-                        generation: *generation,
-                        value: state.clone(),
-                        saved_at_ms: now_ms(),
-                    }) {
+                    if let Err(error) = persistence_snapshot(
+                        Arc::clone(store),
+                        DurableSnapshot {
+                            format_version: PERSISTENCE_FORMAT_VERSION,
+                            sync_key: sync_key.into(),
+                            generation: *generation,
+                            value: state.clone(),
+                            saved_at_ms: now_ms(),
+                        },
+                    )
+                    .await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
@@ -1497,11 +1597,15 @@ async fn handle_write<B: Backend + ?Sized>(
             let result = backend.patch(&backend_path, data).await;
             if result.is_ok() {
                 if let (Some(store), Some(mutation)) = (persistence, durable) {
-                    if let Err(error) = store.acknowledge_mutation(sync_key, mutation.id) {
+                    if let Err(error) =
+                        persistence_ack(Arc::clone(store), sync_key.into(), mutation.id).await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
-                    if let Err(error) = store.compact(sync_key) {
+                    if let Err(error) =
+                        persistence_compact(Arc::clone(store), sync_key.into()).await
+                    {
                         let _ = done.send(Err(error.clone()));
                         return Err(error);
                     }
