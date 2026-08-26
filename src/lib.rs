@@ -1469,10 +1469,13 @@ mod tests {
             .unwrap_or(32);
         for path in 0..path_count {
             let root = test_root(&format!("restart/{path}"));
-            backend
-                .put(&root, serde_json::json!({"path": path, "generation": 1}))
-                .await
-                .unwrap();
+            emulator_put_retry(
+                &backend,
+                &root,
+                serde_json::json!({"path": path, "generation": 1}),
+            )
+            .await
+            .unwrap();
             let stream_backend = Arc::new(
                 RtdbBackend::new(format!("http://{host}"), "")
                     .with_namespace("demo-rtdb-sync-default-rtdb"),
@@ -1514,13 +1517,13 @@ mod tests {
         .await
         .unwrap();
         for path in 0..path_count {
-            backend
-                .put(
-                    &test_root(&format!("restart/{path}")),
-                    serde_json::json!({"path": path, "generation": 2}),
-                )
-                .await
-                .unwrap();
+            emulator_put_retry(
+                &backend,
+                &test_root(&format!("restart/{path}")),
+                serde_json::json!({"path": path, "generation": 2}),
+            )
+            .await
+            .unwrap();
         }
         for (path, handle) in &handles {
             let mut updates = handle.subscribe();
@@ -1822,6 +1825,24 @@ mod tests {
 
     fn test_root(label: &str) -> String {
         format!("rtdb-sync-tests/{}/{label}", std::process::id())
+    }
+
+    async fn emulator_put_retry(
+        backend: &RtdbBackend,
+        path: &str,
+        value: Value,
+    ) -> Result<(), SyncError> {
+        let mut last = None;
+        for _ in 0..60 {
+            match backend.put(path, value.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last = Some(error);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| SyncError::Backend("emulator did not accept write".into())))
     }
 
     #[test]
