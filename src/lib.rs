@@ -858,7 +858,12 @@ impl RtdbBackend {
         self
     }
     pub fn typed_client(&self) -> rtdb_typed::TypedClient {
-        rtdb_typed::TypedClient::from_parts(&self.base_url, &self.token)
+        let client = RtdbClient::new(&self.base_url, &self.token);
+        let client = match &self.namespace {
+            Some(namespace) => client.with_namespace(namespace.clone()),
+            None => client,
+        };
+        rtdb_typed::TypedClient::new(client)
     }
     fn error(error: impl fmt::Debug) -> SyncError {
         SyncError::Backend(format!("{error:?}"))
