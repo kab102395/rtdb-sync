@@ -6,6 +6,7 @@
 2. Local mock tests: deterministic initial GET/SSE sequences, malformed events, disconnects, delayed events, cancellation, and conversion failures.
 3. Firebase Realtime Database emulator: official local behavior for hydration, realtime delivery, namespace isolation, reconnect, and concurrent writers.
 4. Manual heavy profiles: larger local stress runs used to find races/leaks; these are not production throughput benchmarks.
+5. Durable offline acceptance: separate test processes share a file journal while the local RTDB emulator is stopped and restarted.
 
 ## Emulator environment
 
@@ -105,6 +106,21 @@ injected mock failure and rollback tests; a real Firebase service cannot inject
 those transport faults without an external fault proxy.
 
 ## Known release limitation
+
+The durable acceptance flow is reproducible with:
+
+```text
+./scripts/test-emulator-offline.sh
+```
+
+It persists a live emulator snapshot, stops the emulator, queues an optimistic
+mutation while the database is unreachable, starts a new test process with the
+same store, and verifies replay plus journal compaction against the emulator.
+
+The file backend is intentionally plaintext. It restricts its directory to
+0700 and records to 0600 on Unix, but those permissions are not encryption.
+Applications storing secrets or regulated data must provide an encrypted
+backend and must keep credentials/tokens outside the persistence API.
 
 `cargo fmt`, `cargo test --all-targets --all-features`, and clippy with denied
 warnings pass. `cargo package`/publish dry-run cannot complete until the

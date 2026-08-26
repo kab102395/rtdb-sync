@@ -1384,7 +1384,10 @@ async fn handle_write<B: Backend + ?Sized>(
             let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
             if let Some(store) = persistence {
                 let mutation = durable.clone().unwrap();
-                store.append_mutation(&mutation)?;
+                if let Err(error) = store.append_mutation(&mutation) {
+                    let _ = done.send(Err(error.clone()));
+                    return Err(error);
+                }
                 durable_pending.push(mutation);
             }
             if policy == WritePolicy::Optimistic {
@@ -1397,13 +1400,16 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
                 if let Some(store) = persistence {
-                    store.store_snapshot(&DurableSnapshot {
+                    if let Err(error) = store.store_snapshot(&DurableSnapshot {
                         format_version: PERSISTENCE_FORMAT_VERSION,
                         sync_key: sync_key.into(),
                         generation: *generation,
                         value: state.clone(),
                         saved_at_ms: now_ms(),
-                    })?;
+                    }) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
                 }
             }
             pending.push(PendingMutation {
@@ -1413,8 +1419,14 @@ async fn handle_write<B: Backend + ?Sized>(
             let result = backend.put(&backend_path, value).await;
             if result.is_ok() {
                 if let (Some(store), Some(mutation)) = (persistence, durable) {
-                    store.acknowledge_mutation(sync_key, mutation.id)?;
-                    store.compact(sync_key)?;
+                    if let Err(error) = store.acknowledge_mutation(sync_key, mutation.id) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                    if let Err(error) = store.compact(sync_key) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
                     durable_pending.retain(|entry| entry.id != mutation.id);
                 }
             }
@@ -1450,7 +1462,10 @@ async fn handle_write<B: Backend + ?Sized>(
             let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
             if let Some(store) = persistence {
                 let mutation = durable.clone().unwrap();
-                store.append_mutation(&mutation)?;
+                if let Err(error) = store.append_mutation(&mutation) {
+                    let _ = done.send(Err(error.clone()));
+                    return Err(error);
+                }
                 durable_pending.push(mutation);
             }
             if policy == WritePolicy::Optimistic {
@@ -1463,13 +1478,16 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
                 if let Some(store) = persistence {
-                    store.store_snapshot(&DurableSnapshot {
+                    if let Err(error) = store.store_snapshot(&DurableSnapshot {
                         format_version: PERSISTENCE_FORMAT_VERSION,
                         sync_key: sync_key.into(),
                         generation: *generation,
                         value: state.clone(),
                         saved_at_ms: now_ms(),
-                    })?;
+                    }) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
                 }
             }
             pending.push(PendingMutation {
@@ -1479,8 +1497,14 @@ async fn handle_write<B: Backend + ?Sized>(
             let result = backend.patch(&backend_path, data).await;
             if result.is_ok() {
                 if let (Some(store), Some(mutation)) = (persistence, durable) {
-                    store.acknowledge_mutation(sync_key, mutation.id)?;
-                    store.compact(sync_key)?;
+                    if let Err(error) = store.acknowledge_mutation(sync_key, mutation.id) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
+                    if let Err(error) = store.compact(sync_key) {
+                        let _ = done.send(Err(error.clone()));
+                        return Err(error);
+                    }
                     durable_pending.retain(|entry| entry.id != mutation.id);
                 }
             }

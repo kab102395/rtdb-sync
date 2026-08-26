@@ -38,6 +38,34 @@ The core supports Firebase -> Rust synchronization plus delegated local writes:
 
 See `docs/ROADMAP.md` and `docs/ENVIRONMENT_AND_STRESS_TESTING.md`.
 
+## Durable offline mode
+
+Durable mode is opt-in. Supply a `FilePersistence` (or your own
+`PersistenceBackend`), a stable `persistence_key`, and
+`OfflinePolicy::QueueWhileOffline` or `QueueWithLimit`. Restored state is
+reported as `RestoredStale`; after hydration and replay the handle reports
+`Connected`.
+
+```rust,no_run
+use std::{path::PathBuf, sync::Arc};
+use rtdb_sync::{Config, FilePersistence, OfflinePolicy};
+
+let persistence = Arc::new(FilePersistence::new(PathBuf::from("./state"))?);
+let config = Config {
+    persistence: Some(persistence),
+    persistence_key: Some("account-42/profile".into()),
+    offline_policy: OfflinePolicy::QueueWhileOffline,
+    ..Config::default()
+};
+```
+
+Snapshots are atomic/fsynced and the journal is append-oriented and
+versioned. The journal does not persist Firebase credentials or OAuth tokens.
+The file backend stores application data as plaintext; sensitive or regulated
+data requires an encrypted `PersistenceBackend`. Replay is at-least-once
+across the crash window between remote success and durable acknowledgement, so
+application writes should be replacement/idempotent operations where possible.
+
 ## Status
 
 The synchronization core is implemented: hydration, typed snapshots,

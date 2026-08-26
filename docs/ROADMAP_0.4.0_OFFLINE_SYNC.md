@@ -1,5 +1,15 @@
 # rtdb-sync 0.4.0 roadmap — durable offline synchronization foundation
 
+## Current implementation status
+
+The current worktree implements the replaceable memory/file persistence
+boundary, atomic versioned snapshots, append-only mutation journaling,
+acknowledgement and compaction, explicit offline queue policies, stale restore,
+replay after reconnect, corruption detection, namespace isolation, and the
+three-process live-emulator acceptance flow in
+`scripts/test-emulator-offline.sh`. The file backend is plaintext by design;
+callers needing encryption must provide an encrypted persistence backend.
+
 ## Purpose
 
 `rtdb-sync` 0.4.0 is the first offline-capable release milestone for the RTDB Rust ecosystem.
