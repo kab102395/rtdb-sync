@@ -21,12 +21,13 @@ Evidence from this workstation:
   controlled `rtdb-admin` suite passed 13 tests including 100 single-flight
   callers, 64 expiry-boundary callers, 128 outage callers, 100 identities,
   and 1,000 concurrent identity consumers.
-- Break-point escalation reached 250 synchronized SSE paths and failed to
-  establish all handles within the bounded 60-second setup window. At 500
-  paths, the Rust process reached about 395 MiB RSS before the same timeout.
-  Captured emulator samples show the JVM reaching about 598 MiB RSS. This is
+- Break-point escalation was unstable at 250 synchronized SSE paths: one run
+  failed to establish all handles within the bounded 60-second setup window,
+  while the dedicated 250-path soak run later passed in 45 seconds. At 500
+  paths, the Rust process reached about 395 MiB RSS before the same timeout;
+  captured emulator samples show the JVM reaching about 598 MiB RSS. This is
   a measured local emulator/host envelope, not a universal Firebase capacity
-  claim; heavy and soak profiles remain release-blocked pending a capacity
+  claim; the 500-path heavy tier remains release-blocked pending a capacity
   decision or architecture improvement.
 
 The exact crates.io publication graph is not yet testable: crates.io does not
