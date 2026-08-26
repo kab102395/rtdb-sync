@@ -831,6 +831,29 @@ mod tests {
         replacements: AtomicU64,
     }
 
+    struct Cycling {
+        subscriptions: AtomicU64,
+    }
+    #[async_trait]
+    impl Backend for Cycling {
+        async fn get(&self, _: &str) -> Result<Value, SyncError> {
+            Ok(Value::Null)
+        }
+        async fn subscribe(&self, _: &str) -> Result<EventStream, SyncError> {
+            if self.subscriptions.fetch_add(1, Ordering::Relaxed) < 25 {
+                Ok(Box::pin(stream::empty()))
+            } else {
+                Ok(Box::pin(stream::pending()))
+            }
+        }
+        async fn put(&self, _: &str, _: Value) -> Result<(), SyncError> {
+            Ok(())
+        }
+        async fn patch(&self, _: &str, _: Map<String, Value>) -> Result<(), SyncError> {
+            Ok(())
+        }
+    }
+
     struct Failing;
     #[async_trait]
     impl Backend for Failing {
@@ -1304,6 +1327,48 @@ mod tests {
         assert_eq!(handle.metrics().stream_failures, 1);
         assert_eq!(handle.metrics().reconnect_attempts, 1);
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn twenty_five_reconnect_cycles_preserve_state_and_subscribers() {
+        let backend = Arc::new(Cycling {
+            subscriptions: AtomicU64::new(0),
+        });
+        let handle = start(
+            backend,
+            "cycles",
+            Config {
+                retry: RetryPolicy::Exponential {
+                    max_attempts: Some(30),
+                    base: Duration::from_millis(1),
+                    max: Duration::from_millis(2),
+                },
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        assert_eq!(handle.metrics().stream_failures, 25);
+        assert_eq!(handle.metrics().reconnect_attempts, 25);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_hydration_backoff_promptly() {
+        let handle = start(
+            Arc::new(Failing),
+            "backoff",
+            Config {
+                retry: RetryPolicy::Exponential {
+                    max_attempts: None,
+                    base: Duration::from_secs(30),
+                    max: Duration::from_secs(30),
+                },
+                ..Config::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_millis(100), handle.shutdown())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
