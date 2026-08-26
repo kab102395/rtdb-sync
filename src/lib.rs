@@ -791,6 +791,23 @@ mod tests {
         replacements: AtomicU64,
     }
 
+    struct Failing;
+    #[async_trait]
+    impl Backend for Failing {
+        async fn get(&self, _: &str) -> Result<Value, SyncError> {
+            Ok(serde_json::json!({"count": 1}))
+        }
+        async fn subscribe(&self, _: &str) -> Result<EventStream, SyncError> {
+            Ok(Box::pin(stream::pending()))
+        }
+        async fn put(&self, _: &str, _: Value) -> Result<(), SyncError> {
+            Err(SyncError::Backend("injected write failure".into()))
+        }
+        async fn patch(&self, _: &str, _: Map<String, Value>) -> Result<(), SyncError> {
+            Err(SyncError::Backend("injected write failure".into()))
+        }
+    }
+
     #[async_trait]
     impl Backend for Flaky {
         async fn get(&self, _: &str) -> Result<Value, SyncError> {
@@ -1137,6 +1154,27 @@ mod tests {
         assert_eq!(backend.replacements.load(Ordering::Relaxed), 1);
         assert_eq!(handle.metrics().stream_failures, 1);
         assert_eq!(handle.metrics().reconnect_attempts, 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn optimistic_write_rolls_back_on_backend_failure() {
+        let handle = start(
+            Arc::new(Failing),
+            "failing",
+            Config {
+                write_policy: WritePolicy::Optimistic,
+                retry: RetryPolicy::Never,
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        assert_eq!(
+            handle.put("", serde_json::json!({"count": 2})).await,
+            Err(SyncError::Backend("injected write failure".into()))
+        );
+        assert_eq!(handle.snapshot().value, serde_json::json!({"count": 1}));
+        assert_eq!(handle.metrics().failed_writes, 1);
         handle.shutdown().await;
     }
 
