@@ -45,12 +45,17 @@ run_phase() {
     cargo test --lib "tests::$1" -- --ignored --exact
 }
 
+run_crash_phase() {
+  RTDB_DURABLE_STORE="$store_dir" FIREBASE_DATABASE_EMULATOR_HOST=127.0.0.1:9000 \
+    RTDB_DURABLE_CRASH_AFTER_QUEUE=1 cargo test --lib "tests::$1" -- --ignored --exact
+}
+
 echo "Phase 1: persist snapshot against emulator"
 start_emulator
 run_phase durable_emulator_seed_persists_snapshot
 stop_emulator
 echo "Phase 2: queue mutation with emulator stopped"
-run_phase durable_emulator_queues_while_database_is_down
+run_crash_phase durable_emulator_queues_while_database_is_down
 echo "Phase 3: restart emulator and replay durable mutation"
 start_emulator
 run_phase durable_emulator_replays_after_database_returns

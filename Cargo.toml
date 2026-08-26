@@ -1,6 +1,6 @@
 [package]
 name = "rtdb-sync"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Realtime synchronized Rust state for Firebase Realtime Database"
 license = "MIT"

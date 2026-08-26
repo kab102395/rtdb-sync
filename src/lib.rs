@@ -3227,6 +3227,9 @@ mod tests {
             .put("", serde_json::json!({"count": 2}))
             .await
             .unwrap();
+        if std::env::var_os("RTDB_DURABLE_CRASH_AFTER_QUEUE").is_some() {
+            std::process::exit(0);
+        }
         handle.shutdown().await;
         assert_eq!(
             store
