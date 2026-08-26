@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tokio-util = "0.7"
 
 [dev-dependencies]
+rtdb-admin = { path = "../rtdb-admin", features = ["rtdb-client"] }
 
 [patch.crates-io]
 rtdb-rs = { git = "https://github.com/kab102395/rtdb-rs.git", rev = "8e9792f7e434f1f9408ba5f03ff65237ae21d95b" }
