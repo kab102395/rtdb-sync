@@ -8,9 +8,10 @@ if [[ "$project_id" != demo-* ]]; then
   exit 2
 fi
 
-for port in 9000 4000; do
+for port in 9000 4000 4400 4500; do
   if (command -v ss >/dev/null && ss -ltn | awk '{print $4}' | grep -Eq ":${port}$") || \
-     (command -v lsof >/dev/null && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1); then
+     (command -v lsof >/dev/null && lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1) || \
+     (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
     echo "Refusing to start Firebase: host port $port is already listening" >&2
     exit 2
   fi

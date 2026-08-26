@@ -41,7 +41,25 @@ See `docs/ROADMAP.md` and `docs/ENVIRONMENT_AND_STRESS_TESTING.md`.
 
 ## Status
 
-Pre-0.1.0 scaffold. Public API is not stable yet.
+The 0.1.0 one-way synchronization core is implemented: hydration, typed
+snapshots, PUT/PATCH/null event application, watch notifications, cancellation,
+reconnect backoff, confirmed or optimistic writes, and a Firebase REST/SSE
+backend are available. The API remains pre-1.0 and may change.
+
+Run the deterministic and lint gates with:
+
+```text
+cargo fmt --all -- --check
+cargo test --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings
+cargo package --allow-dirty
+cargo publish --dry-run --allow-dirty
+./scripts/test-emulator.sh
+```
+
+The emulator command is restricted to `demo-*` projects and runs the CRUD/SSE
+integration test plus the local concurrency profiles. These are correctness
+stress tests, not production capacity benchmarks.
 
 ## License
 

@@ -87,3 +87,10 @@ These tests are functional concurrency and correctness stress tests. They should
 ## Release discipline
 
 For every release candidate: run formatting, clippy with warnings denied, all deterministic tests, package verification, publish dry-run, then the standard emulator stress profile. Heavy profiles are required before milestone releases and whenever synchronization internals materially change.
+
+## Current implementation gap
+
+The current tests include only synthetic preloaded-event profiles for 32 paths
+and 64 subscribers, plus a direct Firebase adapter CRUD/SSE smoke test. They do
+not yet satisfy the remote-mutation, churn, namespace, outage/recovery, or
+bidirectional conflict profiles above. Those profiles remain release blockers.
