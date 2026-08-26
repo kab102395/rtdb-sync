@@ -219,6 +219,8 @@ pub struct Config {
     pub write_policy: WritePolicy,
     pub jitter_max: Duration,
     pub conflict_policy: ConflictPolicy,
+    /// Maximum number of local mutations waiting for the synchronization task.
+    pub write_queue_capacity: usize,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -231,6 +233,7 @@ impl Default for Config {
             write_policy: WritePolicy::Confirmed,
             jitter_max: Duration::ZERO,
             conflict_policy: ConflictPolicy::RemoteWins,
+            write_queue_capacity: 64,
         }
     }
 }
@@ -351,7 +354,7 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
     });
     let (status_tx, status_rx) = watch::channel(SyncStatus::Idle);
     let cancel = CancellationToken::new();
-    let (writes, mut write_rx) = mpsc::channel(64);
+    let (writes, mut write_rx) = mpsc::channel(config.write_queue_capacity.max(1));
     let child = cancel.clone();
     let metrics = Arc::new(Metrics::default());
     let task_metrics = metrics.clone();
@@ -485,23 +488,26 @@ async fn handle_write<B: Backend + ?Sized>(
     match write {
         Write::Put(path, value, done) => {
             let old = state.clone();
+            let backend_path = join(root, &path)?;
             let event = Event::Put {
                 path: path.clone(),
                 data: value.clone(),
             };
-            pending.push(PendingMutation {
-                path: path.clone(),
-                event: event.clone(),
-            });
             if policy == WritePolicy::Optimistic {
-                apply_event(root, state, event.clone())?;
+                let mut next = state.clone();
+                apply_event(root, &mut next, event.clone())?;
+                *state = next;
                 *generation += 1;
                 let _ = tx.send(Snapshot {
                     generation: *generation,
                     value: state.clone(),
                 });
             }
-            let result = backend.put(&join(root, &path)?, value).await;
+            pending.push(PendingMutation {
+                path: path.clone(),
+                event: event.clone(),
+            });
+            let result = backend.put(&backend_path, value).await;
             if result.is_err() && policy == WritePolicy::Optimistic {
                 *state = old;
                 *generation += 1;
@@ -518,23 +524,26 @@ async fn handle_write<B: Backend + ?Sized>(
         }
         Write::Patch(path, data, done) => {
             let old = state.clone();
+            let backend_path = join(root, &path)?;
             let event = Event::Patch {
                 path: path.clone(),
                 data: data.clone(),
             };
-            pending.push(PendingMutation {
-                path: path.clone(),
-                event: event.clone(),
-            });
             if policy == WritePolicy::Optimistic {
-                apply_event(root, state, event.clone())?;
+                let mut next = state.clone();
+                apply_event(root, &mut next, event.clone())?;
+                *state = next;
                 *generation += 1;
                 let _ = tx.send(Snapshot {
                     generation: *generation,
                     value: state.clone(),
                 });
             }
-            let result = backend.patch(&join(root, &path)?, data).await;
+            pending.push(PendingMutation {
+                path: path.clone(),
+                event: event.clone(),
+            });
+            let result = backend.patch(&backend_path, data).await;
             if result.is_err() && policy == WritePolicy::Optimistic {
                 *state = old;
                 *generation += 1;
@@ -1453,7 +1462,12 @@ mod tests {
                 .with_namespace("demo-rtdb-sync-default-rtdb"),
         );
         let mut handles = Vec::new();
-        for path in 0..32 {
+        let path_count = std::env::var("RTDB_RECOVERY_PATHS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(32);
+        for path in 0..path_count {
             let root = test_root(&format!("restart/{path}"));
             backend
                 .put(&root, serde_json::json!({"path": path, "generation": 1}))
