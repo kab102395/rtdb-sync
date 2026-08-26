@@ -808,6 +808,48 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct Live {
+        value: Arc<Mutex<Value>>,
+        events: tokio::sync::broadcast::Sender<Event>,
+    }
+    #[async_trait]
+    impl Backend for Live {
+        async fn get(&self, _: &str) -> Result<Value, SyncError> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+        async fn subscribe(&self, _: &str) -> Result<EventStream, SyncError> {
+            let mut receiver = self.events.subscribe();
+            Ok(Box::pin(async_stream::stream! {
+                loop { match receiver.recv().await { Ok(event) => yield Ok(event), Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, Err(tokio::sync::broadcast::error::RecvError::Closed) => break } }
+            }))
+        }
+        async fn put(&self, _: &str, value: Value) -> Result<(), SyncError> {
+            *self.value.lock().unwrap() = value.clone();
+            let _ = self.events.send(Event::Put {
+                path: "".into(),
+                data: value,
+            });
+            Ok(())
+        }
+        async fn patch(&self, _: &str, value: Map<String, Value>) -> Result<(), SyncError> {
+            let mut current = self.value.lock().unwrap();
+            apply_event(
+                "",
+                &mut current,
+                Event::Patch {
+                    path: "".into(),
+                    data: value.clone(),
+                },
+            )?;
+            let _ = self.events.send(Event::Patch {
+                path: "".into(),
+                data: value,
+            });
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl Backend for Flaky {
         async fn get(&self, _: &str) -> Result<Value, SyncError> {
@@ -1175,6 +1217,40 @@ mod tests {
         );
         assert_eq!(handle.snapshot().value, serde_json::json!({"count": 1}));
         assert_eq!(handle.metrics().failed_writes, 1);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_local_and_remote_writers_converge_without_echo_loop() {
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        let backend = Arc::new(Live {
+            value: Arc::new(Mutex::new(serde_json::json!({"count": 0}))),
+            events,
+        });
+        let handle = start(
+            backend.clone(),
+            "writers",
+            Config {
+                write_policy: WritePolicy::Optimistic,
+                conflict_policy: ConflictPolicy::RemoteWins,
+                retry: RetryPolicy::Never,
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        for count in 1..=100u64 {
+            let local = handle.put("", serde_json::json!({"count": count}));
+            let remote = backend.put("", serde_json::json!({"count": count + 10_000}));
+            let (local_result, remote_result) = tokio::join!(local, remote);
+            local_result.unwrap();
+            remote_result.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            handle.snapshot().value,
+            backend.get("writers").await.unwrap()
+        );
+        assert_eq!(handle.metrics().successful_writes, 100);
         handle.shutdown().await;
     }
 
