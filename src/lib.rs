@@ -1258,6 +1258,54 @@ mod tests {
         assert_eq!(right.get("isolation").await.unwrap()["owner"], "right");
     }
 
+    #[tokio::test]
+    #[ignore = "run through scripts/test-emulator-recovery.sh"]
+    async fn emulator_restart_rehydrates_and_recovers() {
+        let host = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST").expect("emulator host");
+        let ready = std::env::var("RTDB_RECOVERY_READY").expect("ready marker");
+        let restored = std::env::var("RTDB_RECOVERY_RESTORED").expect("restored marker");
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "")
+                .with_namespace("demo-rtdb-sync-default-rtdb"),
+        );
+        let root = test_root("restart");
+        backend
+            .put(&root, serde_json::json!({"generation": 1}))
+            .await
+            .unwrap();
+        let handle = start(
+            backend.clone(),
+            root.clone(),
+            Config {
+                retry: RetryPolicy::Exponential {
+                    max_attempts: Some(20),
+                    base: Duration::from_millis(100),
+                    max: Duration::from_secs(1),
+                },
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        std::fs::write(&ready, "connected").unwrap();
+        while !std::path::Path::new(&restored).exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        backend
+            .put(&root, serde_json::json!({"generation": 2}))
+            .await
+            .unwrap();
+        let mut updates = handle.subscribe();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while updates.borrow().value["generation"] != 2 {
+                updates.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle.metrics().reconnect_attempts >= 1);
+        handle.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn fanout_64_subscribers_converge() {
         let events = (1..=250)
