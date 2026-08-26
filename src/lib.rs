@@ -721,7 +721,7 @@ mod tests {
         let Ok(host) = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST") else {
             return;
         };
-        let root = format!("rtdb-sync-test/{}", std::process::id());
+        let root = test_root("crud");
         let backend = FirebaseBackend::new(format!("http://{host}"));
         backend
             .put(&root, serde_json::json!({"generation": 1}))
@@ -765,20 +765,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn standard_32_path_profile_converges() {
+        let Ok(host) = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST") else {
+            return;
+        };
+        let backend = Arc::new(FirebaseBackend::new(format!("http://{host}")));
         let mut handles = Vec::new();
         for path in 0..32 {
-            let events = (1..=50)
-                .map(|generation| Event::Put {
-                    path: "".into(),
-                    data: serde_json::json!({"path": path, "generation": generation}),
-                })
-                .collect();
             let handle = start(
-                Arc::new(mock(
-                    serde_json::json!({"path": path, "generation": 0}),
-                    events,
-                )),
-                format!("paths/{path}"),
+                backend.clone(),
+                test_root(&format!("paths/{path}")),
                 Config {
                     retry: RetryPolicy::Never,
                     ..Config::default()
@@ -787,8 +782,52 @@ mod tests {
             handles.push((path, handle));
         }
         for (path, handle) in &handles {
+            wait_for_status(handle, SyncStatus::Connected).await;
+            backend
+                .put(
+                    &test_root(&format!("paths/{path}")),
+                    serde_json::json!({"path": path, "generation": 0}),
+                )
+                .await
+                .unwrap();
+        }
+        for generation in 1..=50 {
+            for path in 0..32 {
+                let root = test_root(&format!("paths/{path}"));
+                match generation % 3 {
+                    0 => backend
+                        .put(
+                            &root,
+                            serde_json::json!({"path": path, "generation": generation}),
+                        )
+                        .await
+                        .unwrap(),
+                    1 => backend
+                        .patch(
+                            &root,
+                            serde_json::json!({"generation": generation})
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                        )
+                        .await
+                        .unwrap(),
+                    _ => {
+                        backend.put(&root, Value::Null).await.unwrap();
+                        backend
+                            .put(
+                                &root,
+                                serde_json::json!({"path": path, "generation": generation}),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        for (path, handle) in &handles {
             let mut updates = handle.subscribe();
-            tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::timeout(Duration::from_secs(10), async {
                 while updates.borrow().value["generation"] != 50 {
                     updates.changed().await.unwrap();
                 }
@@ -830,6 +869,36 @@ mod tests {
             assert_eq!(receiver.borrow().value["generation"], 250);
         }
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifecycle_churn_stops_one_hundred_tasks() {
+        for _ in 0..100 {
+            let handle = start(
+                Arc::new(mock(Value::Null, vec![])),
+                "churn",
+                Config {
+                    retry: RetryPolicy::Never,
+                    ..Config::default()
+                },
+            );
+            handle.shutdown().await;
+        }
+    }
+
+    async fn wait_for_status(handle: &SyncHandle, expected: SyncStatus) {
+        let mut status = handle.subscribe_status();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while status.borrow().clone() != expected {
+                status.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn test_root(label: &str) -> String {
+        format!("rtdb-sync-tests/{}/{label}", std::process::id())
     }
 
     #[test]
