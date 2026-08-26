@@ -121,11 +121,19 @@ pub enum WritePolicy {
     Optimistic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    RemoteWins,
+    LocalWins,
+    Reject,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub retry: RetryPolicy,
     pub write_policy: WritePolicy,
     pub jitter_max: Duration,
+    pub conflict_policy: ConflictPolicy,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -137,6 +145,7 @@ impl Default for Config {
             },
             write_policy: WritePolicy::Confirmed,
             jitter_max: Duration::ZERO,
+            conflict_policy: ConflictPolicy::RemoteWins,
         }
     }
 }
@@ -190,6 +199,11 @@ enum Write {
         Map<String, Value>,
         tokio::sync::oneshot::Sender<Result<(), SyncError>>,
     ),
+}
+
+struct PendingMutation {
+    path: String,
+    event: Event,
 }
 
 impl SyncHandle {
@@ -261,6 +275,7 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
         let mut state: Option<Value> = None;
         let mut generation = 0;
         let mut attempt = 0usize;
+        let mut pending = Vec::new();
         let _ = status_tx.send(SyncStatus::Hydrating);
         loop {
             let hydrated = tokio::select! { _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; }, result = backend.get(&path) => result };
@@ -318,8 +333,8 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             loop {
                 tokio::select! {
                     _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
-                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, write, config.write_policy).await; if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
-                event = stream.next() => match event { Some(Ok(event)) => match apply_event(&path, state.as_mut().expect("hydrated"), event) { Ok(()) => { generation += 1; let _ = snap_tx.send(Snapshot { generation, value: state.as_ref().expect("hydrated").clone() }); }, Err(e) => { let _ = status_tx.send(SyncStatus::Failed(e)); return; } }, Some(Err(_)) | None => break }
+                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, write, config.write_policy).await; if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
+                event = stream.next() => match event { Some(Ok(event)) => match reconcile_event(&path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, event, config.conflict_policy) { Ok(()) => {}, Err(e) => { let _ = status_tx.send(SyncStatus::Failed(e)); return; } }, Some(Err(_)) | None => break }
                 }
             }
             task_metrics.stream_failures.fetch_add(1, Ordering::Relaxed);
@@ -371,27 +386,30 @@ async fn retry<B: Backend + ?Sized>(
     tokio::select! { _ = cancel.cancelled() => false, _ = tokio::time::sleep(delay) => true }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_write<B: Backend + ?Sized>(
     backend: &B,
     root: &str,
     state: &mut Value,
     generation: &mut u64,
     tx: &watch::Sender<Snapshot>,
+    pending: &mut Vec<PendingMutation>,
     write: Write,
     policy: WritePolicy,
 ) -> Result<(), SyncError> {
     match write {
         Write::Put(path, value, done) => {
             let old = state.clone();
+            let event = Event::Put {
+                path: path.clone(),
+                data: value.clone(),
+            };
+            pending.push(PendingMutation {
+                path: path.clone(),
+                event: event.clone(),
+            });
             if policy == WritePolicy::Optimistic {
-                apply_event(
-                    root,
-                    state,
-                    Event::Put {
-                        path: path.clone(),
-                        data: value.clone(),
-                    },
-                )?;
+                apply_event(root, state, event.clone())?;
                 *generation += 1;
                 let _ = tx.send(Snapshot {
                     generation: *generation,
@@ -407,20 +425,24 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
             }
+            if result.is_err() {
+                pending.retain(|mutation| mutation.path != path);
+            }
             let _ = done.send(result.clone());
             result
         }
         Write::Patch(path, data, done) => {
             let old = state.clone();
+            let event = Event::Patch {
+                path: path.clone(),
+                data: data.clone(),
+            };
+            pending.push(PendingMutation {
+                path: path.clone(),
+                event: event.clone(),
+            });
             if policy == WritePolicy::Optimistic {
-                apply_event(
-                    root,
-                    state,
-                    Event::Patch {
-                        path: path.clone(),
-                        data: data.clone(),
-                    },
-                )?;
+                apply_event(root, state, event.clone())?;
                 *generation += 1;
                 let _ = tx.send(Snapshot {
                     generation: *generation,
@@ -436,9 +458,65 @@ async fn handle_write<B: Backend + ?Sized>(
                     value: state.clone(),
                 });
             }
+            if result.is_err() {
+                pending.retain(|mutation| mutation.path != path);
+            }
             let _ = done.send(result.clone());
             result
         }
+    }
+}
+
+fn reconcile_event(
+    root: &str,
+    state: &mut Value,
+    generation: &mut u64,
+    tx: &watch::Sender<Snapshot>,
+    pending: &mut Vec<PendingMutation>,
+    event: Event,
+    policy: ConflictPolicy,
+) -> Result<(), SyncError> {
+    if let Some(index) = pending
+        .iter()
+        .position(|mutation| mutation.path == event_path(&event))
+    {
+        let mutation = &pending[index];
+        if equivalent_event(&mutation.event, &event) {
+            pending.remove(index);
+            return Ok(());
+        }
+        match policy {
+            ConflictPolicy::LocalWins => return Ok(()),
+            ConflictPolicy::Reject => {
+                return Err(SyncError::Conflict(format!(
+                    "remote event conflicts at {}",
+                    event_path(&event)
+                )))
+            }
+            ConflictPolicy::RemoteWins => {
+                pending.remove(index);
+            }
+        }
+    }
+    apply_event(root, state, event)?;
+    *generation += 1;
+    let _ = tx.send(Snapshot {
+        generation: *generation,
+        value: state.clone(),
+    });
+    Ok(())
+}
+
+fn event_path(event: &Event) -> &str {
+    match event {
+        Event::Put { path, .. } | Event::Patch { path, .. } => path,
+    }
+}
+fn equivalent_event(left: &Event, right: &Event) -> bool {
+    match (left, right) {
+        (Event::Put { path: a, data: b }, Event::Put { path: c, data: d }) => a == c && b == d,
+        (Event::Patch { path: a, data: b }, Event::Patch { path: c, data: d }) => a == c && b == d,
+        _ => false,
     }
 }
 
@@ -1102,5 +1180,71 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn conflict_policy_is_explicit_and_echoes_are_suppressed() {
+        let (tx, rx) = watch::channel(Snapshot {
+            generation: 0,
+            value: serde_json::json!({"count": 2}),
+        });
+        let mut state = serde_json::json!({"count": 2});
+        let mut pending = vec![PendingMutation {
+            path: "".into(),
+            event: Event::Put {
+                path: "".into(),
+                data: serde_json::json!({"count": 2}),
+            },
+        }];
+        let mut generation = 0;
+        reconcile_event(
+            "root",
+            &mut state,
+            &mut generation,
+            &tx,
+            &mut pending,
+            Event::Put {
+                path: "".into(),
+                data: serde_json::json!({"count": 2}),
+            },
+            ConflictPolicy::Reject,
+        )
+        .unwrap();
+        assert_eq!(generation, 0);
+        pending.push(PendingMutation {
+            path: "".into(),
+            event: Event::Put {
+                path: "".into(),
+                data: serde_json::json!({"count": 2}),
+            },
+        });
+        reconcile_event(
+            "root",
+            &mut state,
+            &mut generation,
+            &tx,
+            &mut pending,
+            Event::Put {
+                path: "".into(),
+                data: serde_json::json!({"count": 3}),
+            },
+            ConflictPolicy::LocalWins,
+        )
+        .unwrap();
+        assert_eq!(state["count"], 2);
+        assert!(reconcile_event(
+            "root",
+            &mut state,
+            &mut generation,
+            &tx,
+            &mut pending,
+            Event::Put {
+                path: "".into(),
+                data: serde_json::json!({"count": 4})
+            },
+            ConflictPolicy::Reject
+        )
+        .is_err());
+        drop(rx);
     }
 }
