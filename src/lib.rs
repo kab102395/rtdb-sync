@@ -746,6 +746,98 @@ pub struct RtdbBackend {
     namespace: Option<String>,
 }
 
+/// Typed transport adapter. `rtdb-typed` converts complete PUT events and
+/// models; partial PATCH payloads intentionally remain JSON until the local
+/// state has applied them.
+pub struct TypedBackend<T> {
+    client: Arc<rtdb_typed::TypedClient>,
+    marker: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for TypedBackend<T> {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> TypedBackend<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    pub fn new(client: rtdb_typed::TypedClient) -> Self {
+        Self {
+            client: Arc::new(client),
+            marker: std::marker::PhantomData,
+        }
+    }
+    pub fn from_parts(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::new(rtdb_typed::TypedClient::from_parts(base_url, token))
+    }
+}
+
+#[async_trait]
+impl<T> Backend for TypedBackend<T>
+where
+    T: Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    async fn get(&self, path: &str) -> Result<Value, SyncError> {
+        self.client
+            .get::<T>(path)
+            .await
+            .map_err(RtdbBackend::error)
+            .and_then(|value| {
+                serde_json::to_value(value)
+                    .map_err(|error| SyncError::Conversion(error.to_string()))
+            })
+    }
+    async fn subscribe(&self, path: &str) -> Result<EventStream, SyncError> {
+        let stream = self
+            .client
+            .query::<T>(path)
+            .stream()
+            .await
+            .map_err(RtdbBackend::error)?;
+        let stream = stream.filter_map(|event| async move {
+            match event {
+                Ok(rtdb_typed::TypedEvent::Put { path, data }) => Some(
+                    serde_json::to_value(data)
+                        .map(|data| Event::Put { path, data })
+                        .map_err(|error| SyncError::Conversion(error.to_string())),
+                ),
+                Ok(rtdb_typed::TypedEvent::Patch { path, data }) => Some(Ok(Event::Patch {
+                    path,
+                    data: data.as_object().cloned().unwrap_or_default(),
+                })),
+                Ok(rtdb_typed::TypedEvent::KeepAlive) => None,
+                Ok(rtdb_typed::TypedEvent::Cancel) => {
+                    Some(Err(SyncError::Backend("Firebase stream cancelled".into())))
+                }
+                Err(error) => Some(Err(RtdbBackend::error(error))),
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+    async fn put(&self, path: &str, value: Value) -> Result<(), SyncError> {
+        self.client
+            .inner()
+            .put(path, &value)
+            .await
+            .map(|_| ())
+            .map_err(RtdbBackend::error)
+    }
+    async fn patch(&self, path: &str, value: Map<String, Value>) -> Result<(), SyncError> {
+        self.client
+            .inner()
+            .patch(path, &Value::Object(value))
+            .await
+            .map(|_| ())
+            .map_err(RtdbBackend::error)
+    }
+}
+
 impl RtdbBackend {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
         let base_url = base_url.into();
