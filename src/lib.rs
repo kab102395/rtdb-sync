@@ -2,7 +2,7 @@
 //!
 //! `rtdb-sync` owns local synchronization semantics.  A [`Backend`] supplies
 //! hydration, realtime events, and writes; the Firebase REST/SSE implementation
-//! is provided as [`FirebaseBackend`].
+//! is provided as [`RtdbBackend`].
 
 use async_trait::async_trait;
 use futures_core::Stream;
@@ -728,127 +728,6 @@ impl Backend for RtdbBackend {
     }
 }
 
-/// Firebase Realtime Database REST + Server-Sent Events backend.
-#[derive(Clone)]
-pub struct FirebaseBackend {
-    client: reqwest::Client,
-    base_url: String,
-    bearer: Option<String>,
-}
-impl FirebaseBackend {
-    pub fn new(base_url: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.into().trim_end_matches('/').into(),
-            bearer: None,
-        }
-    }
-    pub fn with_bearer(mut self, token: impl Into<String>) -> Self {
-        self.bearer = Some(token.into());
-        self
-    }
-    fn request(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}.json", self.base_url, path.trim_matches('/'));
-        let req = self.client.get(url);
-        if let Some(token) = &self.bearer {
-            req.query(&[("access_token", token)])
-        } else {
-            req
-        }
-    }
-    async fn check(response: reqwest::Response) -> Result<reqwest::Response, SyncError> {
-        if response.status().is_success() {
-            Ok(response)
-        } else {
-            Err(SyncError::Backend(format!("HTTP {}", response.status())))
-        }
-    }
-}
-#[async_trait]
-impl Backend for FirebaseBackend {
-    async fn get(&self, path: &str) -> Result<Value, SyncError> {
-        let r = Self::check(
-            self.request(path)
-                .send()
-                .await
-                .map_err(|e| SyncError::Backend(e.to_string()))?,
-        )
-        .await?;
-        r.json()
-            .await
-            .map_err(|e| SyncError::Backend(e.to_string()))
-    }
-    async fn subscribe(&self, path: &str) -> Result<EventStream, SyncError> {
-        let url = format!("{}/{}.json", self.base_url, path.trim_matches('/'));
-        let mut req = self.client.get(url).header("Accept", "text/event-stream");
-        if let Some(token) = &self.bearer {
-            req = req.query(&[("access_token", token)]);
-        }
-        let response = Self::check(
-            req.send()
-                .await
-                .map_err(|e| SyncError::Backend(e.to_string()))?,
-        )
-        .await?;
-        let mut bytes = response.bytes_stream();
-        let stream = async_stream::try_stream! {
-            let mut buffer = String::new();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = chunk.map_err(|e| SyncError::Backend(e.to_string()))?;
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                while let Some(pos) = buffer.find("\n\n") {
-                    let block = buffer.drain(..pos + 2).collect::<String>();
-                    let mut kind = "put";
-                    let mut data = None;
-                    for line in block.lines() {
-                        if let Some(v) = line.strip_prefix("event: ") { kind = v; }
-                        if let Some(v) = line.strip_prefix("data: ") { data = Some(v); }
-                    }
-                    if let Some(raw) = data {
-                        let v: Value = serde_json::from_str(raw).map_err(|e| SyncError::Backend(e.to_string()))?;
-                        let path = v.get("path").and_then(Value::as_str).unwrap_or("").into();
-                        let data = v.get("data").cloned().unwrap_or(Value::Null);
-                        if kind == "patch" {
-                            yield Event::Patch { path, data: data.as_object().cloned().unwrap_or_default() };
-                        } else {
-                            yield Event::Put { path, data };
-                        }
-                    }
-                }
-            }
-        };
-        Ok(Box::pin(stream))
-    }
-    async fn put(&self, path: &str, value: Value) -> Result<(), SyncError> {
-        let url = format!("{}/{}.json", self.base_url, path.trim_matches('/'));
-        let r = Self::check(
-            self.client
-                .put(url)
-                .json(&value)
-                .send()
-                .await
-                .map_err(|e| SyncError::Backend(e.to_string()))?,
-        )
-        .await?;
-        let _ = r.bytes().await;
-        Ok(())
-    }
-    async fn patch(&self, path: &str, value: Map<String, Value>) -> Result<(), SyncError> {
-        let url = format!("{}/{}.json", self.base_url, path.trim_matches('/'));
-        let r = Self::check(
-            self.client
-                .patch(url)
-                .json(&value)
-                .send()
-                .await
-                .map_err(|e| SyncError::Backend(e.to_string()))?,
-        )
-        .await?;
-        let _ = r.bytes().await;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,7 +965,8 @@ mod tests {
             return;
         };
         let root = test_root("crud");
-        let backend = FirebaseBackend::new(format!("http://{host}"));
+        let backend =
+            RtdbBackend::new(format!("http://{host}"), "").with_namespace("demo-rtdb-sync");
         backend
             .put(&root, serde_json::json!({"generation": 1}))
             .await
@@ -1132,7 +1012,9 @@ mod tests {
         let Ok(host) = std::env::var("FIREBASE_DATABASE_EMULATOR_HOST") else {
             return;
         };
-        let backend = Arc::new(FirebaseBackend::new(format!("http://{host}")));
+        let backend = Arc::new(
+            RtdbBackend::new(format!("http://{host}"), "").with_namespace("demo-rtdb-sync"),
+        );
         let mut handles = Vec::new();
         for path in 0..32 {
             let handle = start(
