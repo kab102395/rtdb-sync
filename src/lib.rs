@@ -1500,7 +1500,20 @@ mod tests {
         while !std::path::Path::new(&restored).exists() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        for path in 0..32 {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if handles
+                    .iter()
+                    .all(|(_, handle)| handle.metrics().reconnect_attempts >= 1)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for path in 0..path_count {
             backend
                 .put(
                     &test_root(&format!("restart/{path}")),
