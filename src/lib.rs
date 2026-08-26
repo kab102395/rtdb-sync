@@ -933,6 +933,36 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             let mut stream = match backend.subscribe(&path).await {
                 Ok(s) => s,
                 Err(e) => {
+                    let queue_offline = matches!(
+                        config.offline_policy,
+                        OfflinePolicy::QueueWhileOffline | OfflinePolicy::QueueWithLimit { .. }
+                    );
+                    if queue_offline {
+                        if let Some(store) = persistence.as_ref() {
+                            if !reconnect_or_queue(
+                                &*backend,
+                                &config,
+                                &mut attempt,
+                                &child,
+                                &status_tx,
+                                &task_metrics,
+                                &mut write_rx,
+                                &mut state,
+                                &mut generation,
+                                &snap_tx,
+                                &mut pending,
+                                &mut durable_pending,
+                                store,
+                                &sync_key,
+                            )
+                            .await
+                            {
+                                let _ = status_tx.send(SyncStatus::Failed(e));
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                     if !retry(
                         &*backend,
                         &config,
@@ -953,7 +983,7 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             loop {
                 tokio::select! {
                     _ = child.cancelled() => { let _ = status_tx.send(SyncStatus::Stopped); return; },
-                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, write, config.write_policy).await; if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
+                Some(write) = write_rx.recv() => { let result = handle_write(&*backend, &path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, write, config.write_policy, persistence.as_ref(), &sync_key, &mut durable_pending).await; task_metrics.pending_mutations.store(durable_pending.len() as u64, Ordering::Relaxed); if result.is_ok() { task_metrics.successful_writes.fetch_add(1, Ordering::Relaxed); } else { task_metrics.failed_writes.fetch_add(1, Ordering::Relaxed); let _ = status_tx.send(SyncStatus::Failed(result.clone().unwrap_err())); } },
                 event = stream.next() => match event {
                     Some(Ok(event)) => match reconcile_event(&path, state.as_mut().expect("hydrated"), &mut generation, &snap_tx, &mut pending, event, config.conflict_policy) {
                         Ok(()) => {
@@ -978,6 +1008,36 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
                 }
             }
             task_metrics.stream_failures.fetch_add(1, Ordering::Relaxed);
+            let queue_offline = matches!(
+                config.offline_policy,
+                OfflinePolicy::QueueWhileOffline | OfflinePolicy::QueueWithLimit { .. }
+            );
+            if queue_offline {
+                if let Some(store) = persistence.as_ref() {
+                    if !reconnect_or_queue(
+                        &*backend,
+                        &config,
+                        &mut attempt,
+                        &child,
+                        &status_tx,
+                        &task_metrics,
+                        &mut write_rx,
+                        &mut state,
+                        &mut generation,
+                        &snap_tx,
+                        &mut pending,
+                        &mut durable_pending,
+                        store,
+                        &sync_key,
+                    )
+                    .await
+                    {
+                        let _ = status_tx.send(SyncStatus::Stopped);
+                        return;
+                    }
+                    continue;
+                }
+            }
             if !retry(
                 &*backend,
                 &config,
@@ -1044,6 +1104,37 @@ fn durable_event(mutation: &DurableMutation) -> Result<Event, SyncError> {
             })?,
         }),
     }
+}
+
+fn durable_mutation(
+    sync_key: &str,
+    pending: &[DurableMutation],
+    event: &Event,
+    generation: u64,
+) -> Option<DurableMutation> {
+    let (path, kind, payload) = match event {
+        Event::Put { path, data } => (path.clone(), DurableMutationKind::Put, data.clone()),
+        Event::Patch { path, data } => (
+            path.clone(),
+            DurableMutationKind::Patch,
+            Value::Object(data.clone()),
+        ),
+    };
+    Some(DurableMutation {
+        format_version: PERSISTENCE_FORMAT_VERSION,
+        sync_key: sync_key.into(),
+        id: pending
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1),
+        path,
+        kind,
+        payload,
+        generation,
+        created_at_ms: now_ms(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1134,9 +1225,9 @@ fn handle_offline_write(
 async fn replay_pending<B: Backend + ?Sized>(
     backend: &B,
     root: &str,
-    _state: &mut Value,
-    _generation: &mut u64,
-    _tx: &watch::Sender<Snapshot>,
+    state: &mut Value,
+    generation: &mut u64,
+    tx: &watch::Sender<Snapshot>,
     pending: &mut Vec<PendingMutation>,
     durable_pending: &mut Vec<DurableMutation>,
     persistence: Option<&Arc<dyn PersistenceBackend>>,
@@ -1146,6 +1237,7 @@ async fn replay_pending<B: Backend + ?Sized>(
     for mutation in durable_pending.clone() {
         metrics.replay_attempts.fetch_add(1, Ordering::Relaxed);
         let remote_path = join(root, &mutation.path)?;
+        let event = durable_event(&mutation)?;
         let result = match mutation.kind {
             DurableMutationKind::Put => backend.put(&remote_path, mutation.payload.clone()).await,
             DurableMutationKind::Patch => {
@@ -1163,7 +1255,20 @@ async fn replay_pending<B: Backend + ?Sized>(
             metrics.replay_failures.fetch_add(1, Ordering::Relaxed);
             return Err(error);
         }
+        apply_event(root, state, event.clone())?;
+        *generation += 1;
+        let _ = tx.send(Snapshot {
+            generation: *generation,
+            value: state.clone(),
+        });
         if let Some(store) = persistence {
+            store.store_snapshot(&DurableSnapshot {
+                format_version: PERSISTENCE_FORMAT_VERSION,
+                sync_key: sync_key.into(),
+                generation: *generation,
+                value: state.clone(),
+                saved_at_ms: now_ms(),
+            })?;
             store.acknowledge_mutation(sync_key, mutation.id)?;
         }
         if let Some(index) = durable_pending
@@ -1172,13 +1277,11 @@ async fn replay_pending<B: Backend + ?Sized>(
         {
             durable_pending.remove(index);
         }
-        if let Ok(event) = durable_event(&mutation) {
-            if let Some(index) = pending
-                .iter()
-                .position(|entry| equivalent_event(&entry.event, &event))
-            {
-                pending.remove(index);
-            }
+        if let Some(index) = pending
+            .iter()
+            .position(|entry| equivalent_event(&entry.event, &event))
+        {
+            pending.remove(index);
         }
         metrics.replay_successes.fetch_add(1, Ordering::Relaxed);
     }
@@ -1192,6 +1295,61 @@ async fn replay_pending<B: Backend + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn reconnect_or_queue<B: Backend + ?Sized>(
+    backend: &B,
+    config: &Config,
+    attempt: &mut usize,
+    cancel: &CancellationToken,
+    status: &watch::Sender<SyncStatus>,
+    metrics: &Metrics,
+    write_rx: &mut mpsc::Receiver<Write>,
+    state: &mut Option<Value>,
+    generation: &mut u64,
+    snapshot_tx: &watch::Sender<Snapshot>,
+    pending: &mut Vec<PendingMutation>,
+    durable_pending: &mut Vec<DurableMutation>,
+    persistence: &Arc<dyn PersistenceBackend>,
+    sync_key: &str,
+) -> bool {
+    loop {
+        *attempt = attempt.saturating_add(1);
+        let delay = config
+            .retry
+            .delay(*attempt, config.jitter_max)
+            .unwrap_or(Duration::from_secs(1));
+        metrics.reconnect_attempts.fetch_add(1, Ordering::Relaxed);
+        let _ = status.send(SyncStatus::Offline);
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            Some(write) = write_rx.recv() => {
+                let result = handle_offline_write(
+                    write,
+                    state.get_or_insert(Value::Null),
+                    generation,
+                    snapshot_tx,
+                    pending,
+                    durable_pending,
+                    persistence,
+                    sync_key,
+                    config.offline_policy,
+                );
+                if result.is_ok() {
+                    metrics.successful_writes.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    metrics.failed_writes.fetch_add(1, Ordering::Relaxed);
+                }
+                metrics.pending_mutations.store(durable_pending.len() as u64, Ordering::Relaxed);
+            }
+            _ = tokio::time::sleep(delay) => {
+                if backend.before_reconnect(*attempt).await.is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_write<B: Backend + ?Sized>(
     backend: &B,
     root: &str,
@@ -1201,6 +1359,9 @@ async fn handle_write<B: Backend + ?Sized>(
     pending: &mut Vec<PendingMutation>,
     write: Write,
     policy: WritePolicy,
+    persistence: Option<&Arc<dyn PersistenceBackend>>,
+    sync_key: &str,
+    durable_pending: &mut Vec<DurableMutation>,
 ) -> Result<(), SyncError> {
     match write {
         Write::Put(path, value, done) => {
@@ -1210,6 +1371,12 @@ async fn handle_write<B: Backend + ?Sized>(
                 path: path.clone(),
                 data: value.clone(),
             };
+            let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
+            if let Some(store) = persistence {
+                let mutation = durable.clone().unwrap();
+                store.append_mutation(&mutation)?;
+                durable_pending.push(mutation);
+            }
             if policy == WritePolicy::Optimistic {
                 let mut next = state.clone();
                 apply_event(root, &mut next, event.clone())?;
@@ -1219,12 +1386,28 @@ async fn handle_write<B: Backend + ?Sized>(
                     generation: *generation,
                     value: state.clone(),
                 });
+                if let Some(store) = persistence {
+                    store.store_snapshot(&DurableSnapshot {
+                        format_version: PERSISTENCE_FORMAT_VERSION,
+                        sync_key: sync_key.into(),
+                        generation: *generation,
+                        value: state.clone(),
+                        saved_at_ms: now_ms(),
+                    })?;
+                }
             }
             pending.push(PendingMutation {
                 path: path.clone(),
                 event: event.clone(),
             });
             let result = backend.put(&backend_path, value).await;
+            if result.is_ok() {
+                if let (Some(store), Some(mutation)) = (persistence, durable) {
+                    store.acknowledge_mutation(sync_key, mutation.id)?;
+                    store.compact(sync_key)?;
+                    durable_pending.retain(|entry| entry.id != mutation.id);
+                }
+            }
             if result.is_err() && policy == WritePolicy::Optimistic {
                 *state = old;
                 *generation += 1;
@@ -1254,6 +1437,12 @@ async fn handle_write<B: Backend + ?Sized>(
                 path: path.clone(),
                 data: data.clone(),
             };
+            let durable = durable_mutation(sync_key, durable_pending, &event, *generation + 1);
+            if let Some(store) = persistence {
+                let mutation = durable.clone().unwrap();
+                store.append_mutation(&mutation)?;
+                durable_pending.push(mutation);
+            }
             if policy == WritePolicy::Optimistic {
                 let mut next = state.clone();
                 apply_event(root, &mut next, event.clone())?;
@@ -1263,12 +1452,28 @@ async fn handle_write<B: Backend + ?Sized>(
                     generation: *generation,
                     value: state.clone(),
                 });
+                if let Some(store) = persistence {
+                    store.store_snapshot(&DurableSnapshot {
+                        format_version: PERSISTENCE_FORMAT_VERSION,
+                        sync_key: sync_key.into(),
+                        generation: *generation,
+                        value: state.clone(),
+                        saved_at_ms: now_ms(),
+                    })?;
+                }
             }
             pending.push(PendingMutation {
                 path: path.clone(),
                 event: event.clone(),
             });
             let result = backend.patch(&backend_path, data).await;
+            if result.is_ok() {
+                if let (Some(store), Some(mutation)) = (persistence, durable) {
+                    store.acknowledge_mutation(sync_key, mutation.id)?;
+                    store.compact(sync_key)?;
+                    durable_pending.retain(|entry| entry.id != mutation.id);
+                }
+            }
             if result.is_err() && policy == WritePolicy::Optimistic {
                 *state = old;
                 *generation += 1;
