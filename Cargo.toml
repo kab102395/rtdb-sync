@@ -1,0 +1,15 @@
+[package]
+name = "rtdb-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Realtime synchronized Rust state for Firebase Realtime Database"
+license = "MIT"
+repository = "https://github.com/kab102395/rtdb-sync"
+keywords = ["firebase", "rtdb", "realtime", "sync", "async"]
+categories = ["database", "asynchronous", "web-programming"]
+rust-version = "1.78"
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
