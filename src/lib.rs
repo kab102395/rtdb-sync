@@ -1251,8 +1251,16 @@ mod tests {
         let mut handles = Vec::new();
         for path in 0..64 {
             let root = test_root(&format!("heavy/{path}"));
+            backend
+                .put(&root, serde_json::json!({"path": path, "generation": 0}))
+                .await
+                .unwrap();
+            let stream_backend = Arc::new(
+                RtdbBackend::new(format!("http://{host}"), "")
+                    .with_namespace("demo-rtdb-sync-default-rtdb"),
+            );
             let handle = start(
-                backend.clone(),
+                stream_backend,
                 root,
                 Config {
                     retry: RetryPolicy::Never,
@@ -1261,15 +1269,8 @@ mod tests {
             );
             handles.push((path, handle));
         }
-        for (path, handle) in &handles {
+        for (_path, handle) in &handles {
             wait_for_status(handle, SyncStatus::Connected).await;
-            backend
-                .put(
-                    &test_root(&format!("heavy/{path}")),
-                    serde_json::json!({"path": path, "generation": 0}),
-                )
-                .await
-                .unwrap();
         }
         for generation in 1..=100 {
             let writes = (0..64).map(|path| {
