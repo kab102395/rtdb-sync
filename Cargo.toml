@@ -7,10 +7,12 @@ license = "MIT"
 repository = "https://github.com/kab102395/rtdb-sync"
 keywords = ["firebase", "rtdb", "realtime", "sync", "async"]
 categories = ["database", "asynchronous", "web-programming"]
-rust-version = "1.78"
+rust-version = "1.85"
 
 [dependencies]
 async-trait = "0.1"
+rtdb-rs = { git = "https://github.com/kab102395/rtdb-rs.git", rev = "8e9792f7e434f1f9408ba5f03ff65237ae21d95b" }
+rtdb-typed = { git = "https://github.com/kab102395/rtdb-typed.git", rev = "a1bea9268d72b28d4b4a93972eac8e19b17aaaa6" }
 async-stream = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
@@ -22,3 +24,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"
 tokio-util = "0.7"
 
 [dev-dependencies]
+
+[patch.crates-io]
+rtdb-rs = { git = "https://github.com/kab102395/rtdb-rs.git", rev = "8e9792f7e434f1f9408ba5f03ff65237ae21d95b" }

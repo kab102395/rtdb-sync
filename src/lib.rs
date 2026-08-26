@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use futures_core::Stream;
 use futures_util::StreamExt;
+use rtdb_rs::{RtdbClient, RtdbEvent};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 use std::{
@@ -648,6 +649,82 @@ pub enum SyncStatus {
 impl fmt::Display for SyncStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")
+    }
+}
+
+/// Backend adapter that delegates REST, SSE, authentication parameters, and
+/// emulator namespaces to the upstream `rtdb-rs` transport.
+#[derive(Clone)]
+pub struct RtdbBackend {
+    client: Arc<RtdbClient>,
+    base_url: String,
+    token: String,
+    namespace: Option<String>,
+}
+
+impl RtdbBackend {
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        let token = token.into();
+        Self {
+            client: Arc::new(RtdbClient::new(&base_url, &token)),
+            base_url,
+            token,
+            namespace: None,
+        }
+    }
+    pub fn with_namespace(mut self, namespace: impl Into<String>) -> Self {
+        let namespace = namespace.into();
+        self.client = Arc::new(
+            RtdbClient::new(&self.base_url, &self.token).with_namespace(namespace.clone()),
+        );
+        self.namespace = Some(namespace);
+        self
+    }
+    pub fn typed_client(&self) -> rtdb_typed::TypedClient {
+        rtdb_typed::TypedClient::from_parts(&self.base_url, &self.token)
+    }
+    fn error(error: impl fmt::Debug) -> SyncError {
+        SyncError::Backend(format!("{error:?}"))
+    }
+}
+
+#[async_trait]
+impl Backend for RtdbBackend {
+    async fn get(&self, path: &str) -> Result<Value, SyncError> {
+        self.client.get(path).await.map_err(Self::error)
+    }
+    async fn subscribe(&self, path: &str) -> Result<EventStream, SyncError> {
+        let stream = self.client.stream(path).await.map_err(Self::error)?;
+        let stream = stream.filter_map(|event| async move {
+            match event {
+                Ok(RtdbEvent::Put { path, data }) => Some(Ok(Event::Put { path, data })),
+                Ok(RtdbEvent::Patch { path, data }) => Some(Ok(Event::Patch {
+                    path,
+                    data: data.as_object().cloned().unwrap_or_default(),
+                })),
+                Ok(RtdbEvent::KeepAlive) => None,
+                Ok(RtdbEvent::Cancel) => {
+                    Some(Err(SyncError::Backend("Firebase stream cancelled".into())))
+                }
+                Err(error) => Some(Err(Self::error(error))),
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+    async fn put(&self, path: &str, value: Value) -> Result<(), SyncError> {
+        self.client
+            .put(path, &value)
+            .await
+            .map(|_| ())
+            .map_err(Self::error)
+    }
+    async fn patch(&self, path: &str, value: Map<String, Value>) -> Result<(), SyncError> {
+        self.client
+            .patch(path, &Value::Object(value))
+            .await
+            .map(|_| ())
+            .map_err(Self::error)
     }
 }
 
