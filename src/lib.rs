@@ -1452,42 +1452,64 @@ mod tests {
             RtdbBackend::new(format!("http://{host}"), "")
                 .with_namespace("demo-rtdb-sync-default-rtdb"),
         );
-        let root = test_root("restart");
-        backend
-            .put(&root, serde_json::json!({"generation": 1}))
-            .await
-            .unwrap();
-        let handle = start(
-            backend.clone(),
-            root.clone(),
-            Config {
-                retry: RetryPolicy::Exponential {
-                    max_attempts: Some(20),
-                    base: Duration::from_millis(100),
-                    max: Duration::from_secs(1),
-                },
-                ..Config::default()
-            },
-        );
-        wait_for_status(&handle, SyncStatus::Connected).await;
+        let mut handles = Vec::new();
+        for path in 0..32 {
+            let root = test_root(&format!("restart/{path}"));
+            backend
+                .put(&root, serde_json::json!({"path": path, "generation": 1}))
+                .await
+                .unwrap();
+            let stream_backend = Arc::new(
+                RtdbBackend::new(format!("http://{host}"), "")
+                    .with_namespace("demo-rtdb-sync-default-rtdb"),
+            );
+            handles.push((
+                path,
+                start(
+                    stream_backend,
+                    root,
+                    Config {
+                        retry: RetryPolicy::Exponential {
+                            max_attempts: Some(20),
+                            base: Duration::from_millis(100),
+                            max: Duration::from_secs(1),
+                        },
+                        ..Config::default()
+                    },
+                ),
+            ));
+        }
+        for (_, handle) in &handles {
+            wait_for_status(handle, SyncStatus::Connected).await;
+        }
         std::fs::write(&ready, "connected").unwrap();
         while !std::path::Path::new(&restored).exists() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        backend
-            .put(&root, serde_json::json!({"generation": 2}))
+        for path in 0..32 {
+            backend
+                .put(
+                    &test_root(&format!("restart/{path}")),
+                    serde_json::json!({"path": path, "generation": 2}),
+                )
+                .await
+                .unwrap();
+        }
+        for (path, handle) in &handles {
+            let mut updates = handle.subscribe();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while updates.borrow().value["generation"] != 2 {
+                    updates.changed().await.unwrap();
+                }
+            })
             .await
             .unwrap();
-        let mut updates = handle.subscribe();
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while updates.borrow().value["generation"] != 2 {
-                updates.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        assert!(handle.metrics().reconnect_attempts >= 1);
-        handle.shutdown().await;
+            assert_eq!(updates.borrow().value["path"], *path);
+            assert!(handle.metrics().reconnect_attempts >= 1);
+        }
+        for (_, handle) in handles {
+            handle.shutdown().await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
