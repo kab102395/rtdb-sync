@@ -833,11 +833,13 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
         let mut attempt = 0usize;
         let mut pending = Vec::new();
         let mut durable_pending = Vec::new();
+        let mut restored_base = None;
         if let Some(store) = persistence.as_ref() {
             match persistence_load(store.clone(), sync_key.clone()).await {
                 Ok(restored) => {
                     if let Some(snapshot) = restored.snapshot {
                         state = Some(snapshot.value);
+                        restored_base = state.clone();
                         generation = snapshot.generation;
                         let _ = snap_tx.send(Snapshot {
                             generation,
@@ -885,6 +887,35 @@ pub fn start<B: Backend>(backend: Arc<B>, path: impl Into<String>, config: Confi
             match hydrated {
                 Ok(value) => {
                     state = Some(value);
+                    if let Some(base) = restored_base.take() {
+                        let remote = state.as_ref().expect("hydrated").clone();
+                        if let Err(error) = resolve_restored_conflicts(
+                            &base,
+                            &remote,
+                            config.conflict_policy,
+                            &mut pending,
+                            &mut durable_pending,
+                            persistence.as_ref(),
+                            &sync_key,
+                            &task_metrics,
+                        )
+                        .await
+                        {
+                            if matches!(error, SyncError::Conflict(_)) {
+                                task_metrics.conflict_count.fetch_add(1, Ordering::Relaxed);
+                                let _ = status_tx.send(SyncStatus::Conflict(error));
+                            } else {
+                                task_metrics
+                                    .persistence_failures
+                                    .fetch_add(1, Ordering::Relaxed);
+                                let _ = status_tx.send(SyncStatus::Failed(error));
+                            }
+                            return;
+                        }
+                        task_metrics
+                            .pending_mutations
+                            .store(durable_pending.len() as u64, Ordering::Relaxed);
+                    }
                     let state_ref = state.as_ref().expect("hydration set state");
                     generation += 1;
                     let _ = snap_tx.send(Snapshot {
@@ -1218,6 +1249,12 @@ fn durable_mutation(
     })
 }
 
+fn event_would_change(root: &str, state: &Value, event: &Event) -> Result<bool, SyncError> {
+    let mut candidate = state.clone();
+    apply_event(root, &mut candidate, event.clone())?;
+    Ok(candidate != *state)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_offline_write(
     write: Write,
@@ -1387,6 +1424,54 @@ async fn replay_pending<B: Backend + ?Sized>(
     metrics
         .pending_mutations
         .store(durable_pending.len() as u64, Ordering::Relaxed);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_restored_conflicts(
+    base: &Value,
+    remote: &Value,
+    policy: ConflictPolicy,
+    pending: &mut Vec<PendingMutation>,
+    durable_pending: &mut Vec<DurableMutation>,
+    persistence: Option<&Arc<dyn PersistenceBackend>>,
+    sync_key: &str,
+    metrics: &Metrics,
+) -> Result<(), SyncError> {
+    let mut conflicted = false;
+    for mutation in durable_pending.clone() {
+        let event = durable_event(&mutation)?;
+        if base != remote && event_would_change("", base, &event)? {
+            conflicted = true;
+            match policy {
+                ConflictPolicy::RemoteWins => {
+                    if let Some(store) = persistence {
+                        persistence_ack(store.clone(), sync_key.into(), mutation.id).await?;
+                    }
+                    durable_pending.retain(|entry| entry.id != mutation.id);
+                    if let Some(index) = pending
+                        .iter()
+                        .position(|entry| equivalent_event(&entry.event, &event))
+                    {
+                        pending.remove(index);
+                    }
+                }
+                ConflictPolicy::LocalWins => {}
+                ConflictPolicy::Reject => {
+                    return Err(SyncError::Conflict(format!(
+                        "restored mutation conflicts at {}",
+                        mutation.path
+                    )))
+                }
+            }
+        }
+    }
+    if conflicted {
+        metrics.conflict_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(store) = persistence {
+            persistence_compact(store.clone(), sync_key.into()).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1811,6 +1896,8 @@ pub enum SyncStatus {
     Offline,
     /// Durable local mutations are being replayed.
     Replaying,
+    /// A restored local mutation conflicts with newly hydrated remote state.
+    Conflict(SyncError),
     /// A realtime stream is active.
     Connected,
     /// The stream or hydration request is being retried.
@@ -3144,6 +3231,54 @@ mod tests {
             handle.put("b", 2).await,
             Err(SyncError::Persistence(_))
         ));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restored_pending_mutation_uses_explicit_remote_wins_policy() {
+        let store = Arc::new(MemoryPersistence::default());
+        store
+            .store_snapshot(&DurableSnapshot {
+                format_version: PERSISTENCE_FORMAT_VERSION,
+                sync_key: "conflict".into(),
+                generation: 1,
+                value: serde_json::json!({"count": 1}),
+                saved_at_ms: now_ms(),
+            })
+            .unwrap();
+        store
+            .append_mutation(&DurableMutation {
+                format_version: PERSISTENCE_FORMAT_VERSION,
+                sync_key: "conflict".into(),
+                id: 1,
+                path: "".into(),
+                kind: DurableMutationKind::Put,
+                payload: serde_json::json!({"count": 2}),
+                generation: 2,
+                created_at_ms: now_ms(),
+            })
+            .unwrap();
+        let (events, _) = tokio::sync::broadcast::channel(4);
+        let backend = Arc::new(Recoverable {
+            online: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            value: Arc::new(Mutex::new(serde_json::json!({"count": 9}))),
+            events,
+        });
+        let handle = start(
+            backend.clone(),
+            "root",
+            Config {
+                persistence: Some(store.clone()),
+                persistence_key: Some("conflict".into()),
+                conflict_policy: ConflictPolicy::RemoteWins,
+                ..Config::default()
+            },
+        );
+        wait_for_status(&handle, SyncStatus::Connected).await;
+        assert_eq!(backend.get("root").await.unwrap()["count"], 9);
+        assert_eq!(handle.metrics().conflict_count, 1);
+        assert_eq!(handle.metrics().pending_mutations, 0);
+        assert!(store.load("conflict").unwrap().pending.is_empty());
         handle.shutdown().await;
     }
 
