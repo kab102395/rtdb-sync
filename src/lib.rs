@@ -517,7 +517,15 @@ async fn handle_write<B: Backend + ?Sized>(
                 });
             }
             if result.is_err() {
-                pending.retain(|mutation| mutation.path != path);
+                let mut removed = false;
+                pending.retain(|mutation| {
+                    if !removed && equivalent_event(&mutation.event, &event) {
+                        removed = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             let _ = done.send(result.clone());
             result
@@ -553,7 +561,15 @@ async fn handle_write<B: Backend + ?Sized>(
                 });
             }
             if result.is_err() {
-                pending.retain(|mutation| mutation.path != path);
+                let mut removed = false;
+                pending.retain(|mutation| {
+                    if !removed && equivalent_event(&mutation.event, &event) {
+                        removed = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
             let _ = done.send(result.clone());
             result
