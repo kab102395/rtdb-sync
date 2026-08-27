@@ -15,25 +15,28 @@ Evidence from this workstation:
 
 - Standard profile passed with 100 synchronized paths, two subscribers per
   path, 10,000 mixed mutations, admin client replacement, and final
-  convergence in 6 seconds.
+  convergence. The post-fix 250-path/1,800-generation soak also passed in
+  32.49 seconds (154,752 KiB maximum Rust test RSS).
 - `rtdb-rs` namespace/REST/SSE emulator stress passed; `rtdb-typed` CRUD,
   query, SSE, filtered-child, and fan-out emulator profiles passed; the
   controlled `rtdb-admin` suite passed 13 tests including 100 single-flight
   callers, 64 expiry-boundary callers, 128 outage callers, 100 identities,
   and 1,000 concurrent identity consumers.
-- Break-point escalation was unstable at 250 synchronized SSE paths: one run
-  failed to establish all handles within the bounded 60-second setup window,
-  while the dedicated 250-path soak run later passed in 45 seconds. At 500
-  paths, the Rust process reached about 395 MiB RSS before the same timeout;
-  captured emulator samples show the JVM reaching about 598 MiB RSS. This is
-  a measured local emulator/host envelope, not a universal Firebase capacity
-  claim; the 500-path heavy tier remains release-blocked pending a capacity
-  decision or architecture improvement.
+- Break-point escalation reached a local capacity wall at 250+
+  synchronized SSE paths when the bounded 60-second setup window expired;
+  the dedicated 250-path/1,800-generation soak passed. The post-fix 500-path
+  heavy tier was classified `CAPACITY_LIMIT` after the same setup ceiling,
+  rather than being reported as a correctness success. This is a measured
+  local emulator/host envelope, not a universal Firebase capacity claim; the
+  500-path heavy tier remains release-blocked pending a capacity decision or
+  architecture improvement.
 
 The exact crates.io publication graph is not yet testable: crates.io does not
 currently provide `rtdb-rs 0.3.2`, so standalone `rtdb-admin` and package/
 publish dry-runs requiring that version fail resolution. Local integrated
-testing uses the four checked-out crate revisions recorded in each artifact.
+testing uses the lockfile-pinned Git revisions. Each artifact records both
+those resolved dependency lines and any adjacent workspace checkout commits
+for provenance.
 
 The second-pass integrated gates are also executable now:
 
