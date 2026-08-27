@@ -20,6 +20,9 @@ Evidence from this workstation:
 - The document-duration development soak passed at 100 paths and 100,000
   generations: 14:00.90 test wall time, 2,871,168 KiB maximum Rust RSS, and
   final emulator/sync convergence.
+- The same full-duration soak also passed at 250 paths and 100,000
+  generations: 30:44.69 test wall time, 7,050,432 KiB maximum Rust RSS, and
+  final emulator/sync convergence.
 - `rtdb-rs` namespace/REST/SSE emulator stress passed; `rtdb-typed` CRUD,
   query, SSE, filtered-child, and fan-out emulator profiles passed; the
   controlled `rtdb-admin` suite passed 13 tests including 100 single-flight
@@ -28,7 +31,7 @@ Evidence from this workstation:
 - Break-point escalation is measured with repeated runs at 100, 150, 200,
   250, and 500 paths. A tier with mixed pass/capacity results is reported as
   unstable, and a tier is reported as `CAPACITY_LIMIT` only when all repeated
-  runs hit the bounded setup ceiling. The 250-path/1,800-generation soak
+  runs hit the bounded 180-second setup ceiling. The 250-path/1,800-generation soak
   passed. The latest repeated envelope run passed both 100- and 150-path
   tiers, then found mixed PASS/CAPACITY_LIMIT results at 200 paths and
   stopped as `UNSTABLE`; the post-fix 500-path heavy tier reached the same

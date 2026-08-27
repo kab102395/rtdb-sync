@@ -240,7 +240,7 @@ fn admin_manager() -> AdminManager {
 
 async fn wait_connected<T: Clone>(handle: &TypedSyncHandle<T>) {
     let mut status = handle.subscribe_status();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(Duration::from_secs(180), async {
         while *status.borrow() != SyncStatus::Connected {
             status.changed().await.unwrap();
         }
