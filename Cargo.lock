@@ -983,7 +983,8 @@ dependencies = [
 [[package]]
 name = "rtdb-admin"
 version = "0.1.0"
-source = "git+https://github.com/kab102395/rtdb-admin.git?rev=423bc0c964cd26ab269d4b810b7c46679fd57f6c#423bc0c964cd26ab269d4b810b7c46679fd57f6c"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89bc5207f2200f7328e083f54c87ff3492c8298a813aeb694aa98f9a8b55688b"
 dependencies = [
  "async-trait",
  "jsonwebtoken",
@@ -999,7 +1000,8 @@ dependencies = [
 [[package]]
 name = "rtdb-rs"
 version = "0.3.2"
-source = "git+https://github.com/kab102395/rtdb-rs.git?rev=8e9792f7e434f1f9408ba5f03ff65237ae21d95b#8e9792f7e434f1f9408ba5f03ff65237ae21d95b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "56ff3602bc65fab758184fc635b1d5e322e277b54bdbb568849fc3de3bddef43"
 dependencies = [
  "async-stream",
  "chrono",
@@ -1034,8 +1036,9 @@ dependencies = [
 
 [[package]]
 name = "rtdb-typed"
-version = "0.2.0"
-source = "git+https://github.com/kab102395/rtdb-typed.git?rev=a1bea9268d72b28d4b4a93972eac8e19b17aaaa6#a1bea9268d72b28d4b4a93972eac8e19b17aaaa6"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0402199152e3cdc75fbe93ac6c9fe17e54656cc2a7d8dc59f7e14fd861b9ea4b"
 dependencies = [
  "futures-util",
  "rtdb-rs",
