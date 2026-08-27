@@ -17,19 +17,23 @@ Evidence from this workstation:
   path, 10,000 mixed mutations, admin client replacement, and final
   convergence. The post-fix 250-path/1,800-generation soak also passed in
   32.49 seconds (154,752 KiB maximum Rust test RSS).
+- The document-duration development soak passed at 100 paths and 100,000
+  generations: 14:00.90 test wall time, 2,871,168 KiB maximum Rust RSS, and
+  final emulator/sync convergence.
 - `rtdb-rs` namespace/REST/SSE emulator stress passed; `rtdb-typed` CRUD,
   query, SSE, filtered-child, and fan-out emulator profiles passed; the
   controlled `rtdb-admin` suite passed 13 tests including 100 single-flight
   callers, 64 expiry-boundary callers, 128 outage callers, 100 identities,
   and 1,000 concurrent identity consumers.
-- Break-point escalation reached a local capacity wall at 250+
-  synchronized SSE paths when the bounded 60-second setup window expired;
-  the dedicated 250-path/1,800-generation soak passed. The post-fix 500-path
-  heavy tier was classified `CAPACITY_LIMIT` after the same setup ceiling,
-  rather than being reported as a correctness success. This is a measured
-  local emulator/host envelope, not a universal Firebase capacity claim; the
-  500-path heavy tier remains release-blocked pending a capacity decision or
-  architecture improvement.
+- Break-point escalation is measured with repeated runs at 100, 150, 200,
+  250, and 500 paths. A tier with mixed pass/capacity results is reported as
+  unstable, and a tier is reported as `CAPACITY_LIMIT` only when all repeated
+  runs hit the bounded setup ceiling. The 250-path/1,800-generation soak
+  passed. The latest repeated envelope run passed both 100- and 150-path
+  tiers, then found mixed PASS/CAPACITY_LIMIT results at 200 paths and
+  stopped as `UNSTABLE`; the post-fix 500-path heavy tier reached the same
+  setup wall. This is a measured local emulator/host envelope, not a
+  universal Firebase capacity claim.
 
 The exact crates.io publication graph is not yet testable: crates.io does not
 currently provide `rtdb-rs 0.3.2`, so standalone `rtdb-admin` and package/
